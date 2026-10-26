@@ -10,7 +10,7 @@ use std::time::Duration;
 use a2a::*;
 use a2a_client::jsonrpc::JsonRpcTransport;
 use a2a_client::rest::RestTransport;
-use a2a_client::{LiveConnection, Transport};
+use a2a_client::{LiveAck, LiveConnection, Transport};
 use a2a_grpc::{GrpcHandler, GrpcTransport};
 use a2a_pb::proto::a2a_service_server::A2aServiceServer;
 use a2a_server::jsonrpc::jsonrpc_router;
@@ -29,6 +29,8 @@ use tonic::transport::Server;
 /// Works until told "finish", answering each message it is sent while it does.
 struct ChattyAgent {
     takes_input: bool,
+    /// What an agent that takes no input waits for before it finishes.
+    gate: Arc<tokio::sync::Notify>,
 }
 
 fn status(task: &str, context: &str, state: TaskState, text: &str) -> StreamResponse {
@@ -50,12 +52,13 @@ impl AgentExecutor for ChattyAgent {
         &self,
         mut ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        let gate = self.gate.clone();
         Box::pin(async_stream::stream! {
             let (task, context) = (ctx.task_id.clone(), ctx.context_id.clone());
             yield Ok(status(&task, &context, TaskState::Working, "working"));
             let Some(mut inputs) = ctx.inputs.take() else {
-                // Takes no input: finishes on its own a moment later.
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                // Takes no input: finishes when the test lets it.
+                gate.notified().await;
                 yield Ok(status(&task, &context, TaskState::Completed, "done"));
                 return;
             };
@@ -86,29 +89,38 @@ impl AgentExecutor for ChattyAgent {
     }
 }
 
-fn handler(takes_input: bool) -> Arc<DefaultRequestHandler> {
-    Arc::new(
-        DefaultRequestHandler::new(ChattyAgent { takes_input }, InMemoryTaskStore::new())
-            .with_capabilities(AgentCapabilities {
-                streaming: Some(true),
-                ..AgentCapabilities::default()
-            }),
-    )
+fn handler(takes_input: bool) -> (Arc<DefaultRequestHandler>, Arc<tokio::sync::Notify>) {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            ChattyAgent {
+                takes_input,
+                gate: gate.clone(),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            ..AgentCapabilities::default()
+        }),
+    );
+    (handler, gate)
 }
 
-async fn spawn_http(takes_input: bool) -> String {
-    let handler = handler(takes_input);
+async fn spawn_http(takes_input: bool) -> (String, Arc<tokio::sync::Notify>) {
+    let (handler, gate) = handler(takes_input);
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))
         .nest("/rpc", jsonrpc_router(handler));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{addr}")
+    (format!("http://{addr}"), gate)
 }
 
-async fn spawn_grpc(takes_input: bool) -> String {
-    let service = A2aServiceServer::new(GrpcHandler::new(handler(takes_input)));
+async fn spawn_grpc(takes_input: bool) -> (String, Arc<tokio::sync::Notify>) {
+    let (handler, gate) = handler(takes_input);
+    let service = A2aServiceServer::new(GrpcHandler::new(handler));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = TcpListenerStream::new(listener);
@@ -119,7 +131,7 @@ async fn spawn_grpc(takes_input: bool) -> String {
             .await
             .unwrap()
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), gate)
 }
 
 fn params() -> ServiceParams {
@@ -184,7 +196,10 @@ async fn converse(transport: impl Transport, acknowledges: bool) {
         .await
         .expect("the request is sent");
     if acknowledges {
-        let task = ack.expect("an HTTP call is answered with the task");
+        let LiveAck::Task(task) = ack else {
+            panic!("an HTTP call is answered with the task");
+        };
+        let task = *task;
         assert_eq!(task.id, opening.id);
         let messages = task
             .timeline
@@ -194,7 +209,7 @@ async fn converse(transport: impl Transport, acknowledges: bool) {
             .count();
         assert_eq!(messages, 2, "the acknowledgement reflects the message");
     } else {
-        assert!(ack.is_none());
+        assert!(matches!(ack, LiveAck::Sent));
     }
     let StreamResponse::MessageUpdate(announced) = next(&mut live).await else {
         panic!("the message is announced on the downlink");
@@ -222,7 +237,7 @@ async fn converse(transport: impl Transport, acknowledges: bool) {
 }
 
 /// A message the agent declines is a `StreamError`, and the exchange goes on.
-async fn decline(transport: impl Transport) {
+async fn decline(transport: impl Transport, gate: Arc<tokio::sync::Notify>) {
     let mut live = transport
         .send_live_message(&params(), &send("start", None))
         .await
@@ -249,13 +264,14 @@ async fn decline(transport: impl Transport) {
         }
         other => panic!("expected a StreamError, got {other:?}"),
     }
-    // The agent finishes by itself; the stream was never closed on it.
+    // The agent finishes when let go; the stream was never closed on it.
+    gate.notify_one();
     assert_eq!(text_of(&next(&mut live).await), "done");
 }
 
 #[tokio::test]
 async fn rest_carries_a_live_exchange() {
-    let base = spawn_http(true).await;
+    let (base, _) = spawn_http(true).await;
     converse(
         RestTransport::new(Client::new(), format!("{base}/rest")),
         true,
@@ -265,7 +281,7 @@ async fn rest_carries_a_live_exchange() {
 
 #[tokio::test]
 async fn jsonrpc_carries_a_live_exchange() {
-    let base = spawn_http(true).await;
+    let (base, _) = spawn_http(true).await;
     converse(
         JsonRpcTransport::new(Client::new(), format!("{base}/rpc")),
         true,
@@ -275,26 +291,34 @@ async fn jsonrpc_carries_a_live_exchange() {
 
 #[tokio::test]
 async fn grpc_carries_a_live_exchange() {
-    let endpoint = spawn_grpc(true).await;
+    let (endpoint, _) = spawn_grpc(true).await;
     converse(GrpcTransport::connect(endpoint).await.unwrap(), false).await;
 }
 
 #[tokio::test]
 async fn rest_reports_a_declined_message_as_a_stream_error() {
-    let base = spawn_http(false).await;
-    decline(RestTransport::new(Client::new(), format!("{base}/rest"))).await;
+    let (base, gate) = spawn_http(false).await;
+    decline(
+        RestTransport::new(Client::new(), format!("{base}/rest")),
+        gate,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn jsonrpc_reports_a_declined_message_as_a_stream_error() {
-    let base = spawn_http(false).await;
-    decline(JsonRpcTransport::new(Client::new(), format!("{base}/rpc"))).await;
+    let (base, gate) = spawn_http(false).await;
+    decline(
+        JsonRpcTransport::new(Client::new(), format!("{base}/rpc")),
+        gate,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn grpc_reports_a_declined_message_as_a_stream_error() {
-    let endpoint = spawn_grpc(false).await;
-    decline(GrpcTransport::connect(endpoint).await.unwrap()).await;
+    let (endpoint, gate) = spawn_grpc(false).await;
+    decline(GrpcTransport::connect(endpoint).await.unwrap(), gate).await;
 }
 
 #[tokio::test]
@@ -386,4 +410,134 @@ async fn a_handler_that_cannot_do_live_exchanges_says_so_over_every_binding() {
         .err()
         .unwrap();
     assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+}
+
+/// The exchange ends (the client's stream goes away) while the task keeps
+/// running; the next request is then a call of its own that opens a new
+/// exchange. The client is handed it, not told the request failed.
+async fn reopened_after_the_exchange_ended(transport: impl Transport) {
+    let mut live = transport
+        .send_live_message(&params(), &send("start", None))
+        .await
+        .expect("the exchange opens");
+    let StreamResponse::Task(opening) = next(&mut live).await else {
+        panic!("the exchange opens with the task");
+    };
+    assert_eq!(text_of(&next(&mut live).await), "working");
+    let sender = live.sender.clone();
+    drop(live); // the stream goes away; the server ends the exchange
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let LiveAck::Reopened(mut again) = sender
+        .send(send("hello", Some(&opening.id)))
+        .await
+        .expect("the request is sent")
+    else {
+        panic!("the request opened a new exchange");
+    };
+
+    let StreamResponse::Task(task) = next(&mut again).await else {
+        panic!("a new exchange opens with the task");
+    };
+    let said: Vec<_> = task
+        .timeline
+        .iter()
+        .flatten()
+        .filter_map(|entry| match &entry.content {
+            TimelineContent::Message(m) => m.text().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said, ["start", "hello"], "the message was applied once");
+}
+
+#[tokio::test]
+async fn rest_hands_over_the_exchange_a_request_had_to_reopen() {
+    let (base, _) = spawn_http(true).await;
+    reopened_after_the_exchange_ended(RestTransport::new(Client::new(), format!("{base}/rest")))
+        .await;
+}
+
+#[tokio::test]
+async fn jsonrpc_hands_over_the_exchange_a_request_had_to_reopen() {
+    let (base, _) = spawn_http(true).await;
+    reopened_after_the_exchange_ended(JsonRpcTransport::new(Client::new(), format!("{base}/rpc")))
+        .await;
+}
+
+/// A second client that sends to a task whose exchange is open is input to
+/// that exchange: it is carried out, and it is given the task, not an error.
+async fn joining_another_clients_exchange(first: impl Transport, second: impl Transport) {
+    let mut owner = first
+        .send_live_message(&params(), &send("start", None))
+        .await
+        .expect("the exchange opens");
+    let StreamResponse::Task(opening) = next(&mut owner).await else {
+        panic!("the exchange opens with the task");
+    };
+    assert_eq!(text_of(&next(&mut owner).await), "working");
+
+    let mut joined = second
+        .send_live_message(&params(), &send("hello", Some(&opening.id)))
+        .await
+        .expect("the second client is not told it failed");
+    let StreamResponse::Task(task) = next(&mut joined).await else {
+        panic!("it is given the task");
+    };
+    assert_eq!(task.id, opening.id);
+
+    // The owner's exchange heard the message, and the agent answered.
+    assert!(matches!(
+        next(&mut owner).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+    assert_eq!(text_of(&next(&mut owner).await), "got: hello");
+}
+
+#[tokio::test]
+async fn rest_lets_a_second_client_join_an_open_exchange() {
+    let (base, _) = spawn_http(true).await;
+    joining_another_clients_exchange(
+        RestTransport::new(Client::new(), format!("{base}/rest")),
+        RestTransport::new(Client::new(), format!("{base}/rest")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn jsonrpc_lets_a_second_client_join_an_open_exchange() {
+    let (base, _) = spawn_http(true).await;
+    joining_another_clients_exchange(
+        JsonRpcTransport::new(Client::new(), format!("{base}/rpc")),
+        JsonRpcTransport::new(Client::new(), format!("{base}/rpc")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_client_opens_an_exchange_through_its_interceptors_and_applies_the_tenant() {
+    let (base, _) = spawn_http(true).await;
+    let client =
+        a2a_client::A2AClient::new(RestTransport::new(Client::new(), format!("{base}/rest")))
+            .with_tenant("acme");
+
+    let mut live = client
+        .send_live_message(&send("start", None))
+        .await
+        .expect("the exchange opens");
+    let StreamResponse::Task(opening) = next(&mut live).await else {
+        panic!("the exchange opens with the task");
+    };
+    assert_eq!(text_of(&next(&mut live).await), "working");
+    live.sender
+        .send_message({
+            let mut message = Message::new(Role::User, vec![Part::text("finish")]);
+            message.task_id = Some(opening.id.clone());
+            message
+        })
+        .await
+        .expect("the request is sent");
+    // The client signals the SDK's own version, 1.0 for now, so the message it
+    // sent is not announced to it: the next thing it hears is the outcome.
+    assert_eq!(text_of(&next(&mut live).await), "done");
 }

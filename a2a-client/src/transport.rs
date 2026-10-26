@@ -19,7 +19,23 @@ pub type ServiceParams = HashMap<String, Vec<String>>;
 /// `send` returns there.
 #[async_trait]
 pub trait LiveUplink: Send + Sync {
-    async fn send(&self, request: StreamRequest) -> Result<Option<Task>, A2AError>;
+    async fn send(&self, request: StreamRequest) -> Result<LiveAck, A2AError>;
+}
+
+/// What sending a request on a live exchange came back with.
+#[non_exhaustive]
+pub enum LiveAck {
+    /// The request was written to the exchange's stream (gRPC, SLIMRPC). Whether
+    /// the server accepted it is told on the event stream: a rejection is a
+    /// `StreamError` there.
+    Sent,
+    /// The server received the call and answered with the task as it stands
+    /// (JSON-RPC, REST); its events come on the downlink, not here.
+    Task(Box<Task>),
+    /// The exchange this was meant for had ended, so the server opened a new one
+    /// for the request, which it carried out. Here is that exchange; the old
+    /// events stream has ended.
+    Reopened(Box<LiveConnection>),
 }
 
 /// Sends requests on a live exchange. Cheap to clone; the exchange's uplink
@@ -45,11 +61,14 @@ impl LiveSender {
         self
     }
 
-    /// Sends one request. Returns the task as the server reports it when the
-    /// transport acknowledges calls (HTTP), `None` when it does not (gRPC).
-    /// Whether the server accepted the request is told on the event stream:
-    /// a rejection is a `StreamError` there.
-    pub async fn send(&self, mut request: StreamRequest) -> Result<Option<Task>, A2AError> {
+    /// Sends one request; see [`LiveAck`] for what comes back. Whether the
+    /// server accepted it is told on the event stream: a rejection is a
+    /// `StreamError` there.
+    ///
+    /// On HTTP bindings each request is a call of its own, made with the
+    /// service parameters the exchange was opened with; a credential that has
+    /// expired since is not renewed.
+    pub async fn send(&self, mut request: StreamRequest) -> Result<LiveAck, A2AError> {
         if let Some(tenant) = &self.tenant {
             request.tenant = Some(tenant.clone());
             match &mut request.payload {
@@ -62,7 +81,7 @@ impl LiveSender {
     }
 
     /// Sends `message` to the task the exchange is bound to.
-    pub async fn send_message(&self, message: Message) -> Result<Option<Task>, A2AError> {
+    pub async fn send_message(&self, message: Message) -> Result<LiveAck, A2AError> {
         self.send(StreamRequest {
             tenant: None,
             payload: StreamRequestPayload::SendMessage(SendMessageRequest {

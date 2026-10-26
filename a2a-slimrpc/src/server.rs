@@ -291,12 +291,22 @@ where
                 // what the client can still say; the downlink goes on.
                 let uplink = requests
                     .take_while(|item| futures::future::ready(item.is_ok()))
-                    .filter_map(|item| async move {
-                        let bytes = item.ok()?;
-                        let proto_request =
-                            decode_proto_request::<proto::StreamRequest>(bytes, "StreamRequest")
-                                .ok()?;
-                        Some(pbconv::from_proto_stream_request(&proto_request))
+                    .map(|item| {
+                        // A request that cannot be decoded is carried on as one
+                        // with no payload this version knows, which the
+                        // exchange refuses with a `StreamError`.
+                        item.ok()
+                            .and_then(|bytes| {
+                                decode_proto_request::<proto::StreamRequest>(bytes, "StreamRequest")
+                                    .ok()
+                            })
+                            .map_or_else(
+                                || a2a::StreamRequest {
+                                    tenant: None,
+                                    payload: a2a::StreamRequestPayload::Unrecognised,
+                                },
+                                |request| pbconv::from_proto_stream_request(&request),
+                            )
                     })
                     .boxed();
                 let stream = handler

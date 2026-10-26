@@ -6,6 +6,9 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use crate::middleware::{ServiceParams, User};
 
 /// A client message that reached a running execution on a live stream
@@ -28,6 +31,202 @@ impl ClientInput {
         ClientInput {
             message,
             generation,
+        }
+    }
+}
+
+/// The client messages that arrive while an execution runs, from a live stream
+/// (see [`ExecutorContext::inputs`]).
+///
+/// The server owns the queue behind it: a message that is still unread when
+/// the execution ends is not lost, the server answers its sender with a
+/// `StreamError`. An executor reads with [`recv`](Self::recv), alongside its own
+/// work, and should drain what is there before it finishes a turn.
+pub struct ClientInputs {
+    queue: Arc<InputQueue>,
+}
+
+impl ClientInputs {
+    /// A queue for exercising an executor on its own: whatever the sender
+    /// pushes, `recv` yields.
+    pub fn channel(capacity: usize) -> (ClientInputSender, ClientInputs) {
+        let queue = Arc::new(InputQueue::new(capacity));
+        (
+            ClientInputSender {
+                queue: queue.clone(),
+                closer: Arc::new(CloseOnDrop(queue.clone())),
+            },
+            ClientInputs { queue },
+        )
+    }
+
+    pub(crate) fn from_queue(queue: Arc<InputQueue>) -> Self {
+        ClientInputs { queue }
+    }
+
+    /// The next message, waiting for one if none is queued. `None` once the
+    /// server has closed the queue (the execution is over) and nothing is left.
+    pub async fn recv(&mut self) -> Option<ClientInput> {
+        loop {
+            let notified = self.queue.notify.notified();
+            tokio::pin!(notified);
+            // Registered before the queue is read, so a push in between wakes it.
+            notified.as_mut().enable();
+            {
+                let mut state = self.queue.lock();
+                if let Some(input) = state.items.pop_front() {
+                    return Some(input);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// A message that is already queued, without waiting.
+    pub fn try_recv(&mut self) -> Option<ClientInput> {
+        self.queue.lock().items.pop_front()
+    }
+}
+
+impl std::fmt::Debug for ClientInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientInputs").finish_non_exhaustive()
+    }
+}
+
+/// The sending end of a [`ClientInputs`] made with [`ClientInputs::channel`].
+/// When the last clone is dropped the queue is closed: what was sent is still
+/// read, then `recv` returns `None`.
+#[derive(Clone)]
+pub struct ClientInputSender {
+    queue: Arc<InputQueue>,
+    closer: Arc<CloseOnDrop>,
+}
+
+/// Closes the queue when the last sender goes away.
+struct CloseOnDrop(Arc<InputQueue>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+impl ClientInputSender {
+    /// Queues `input`. `Err` gives it back when the queue is full or closed.
+    pub fn try_send(&self, input: ClientInput) -> Result<(), Box<ClientInput>> {
+        match self.queue.try_reserve() {
+            Ok(permit) => {
+                permit.send(input);
+                Ok(())
+            }
+            Err(_) => Err(Box::new(input)),
+        }
+    }
+
+    /// Ends the queue: what was sent is still read, then `recv` returns `None`.
+    pub fn close(&self) {
+        let _ = &self.closer;
+        self.queue.close();
+    }
+}
+
+/// Why a message could not be queued for the executor.
+pub(crate) enum InputRefusal {
+    Full,
+    Closed,
+}
+
+pub(crate) struct InputQueue {
+    state: Mutex<InputState>,
+    notify: tokio::sync::Notify,
+    capacity: usize,
+}
+
+struct InputState {
+    items: VecDeque<ClientInput>,
+    /// Places promised to permits that have not sent yet.
+    reserved: usize,
+    closed: bool,
+}
+
+impl InputQueue {
+    pub(crate) fn new(capacity: usize) -> Self {
+        InputQueue {
+            state: Mutex::new(InputState {
+                items: VecDeque::new(),
+                reserved: 0,
+                closed: false,
+            }),
+            notify: tokio::sync::Notify::new(),
+            capacity,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, InputState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Secures room for one message, so that recording it can be undone by
+    /// simply not sending.
+    pub(crate) fn try_reserve(self: &Arc<Self>) -> Result<InputPermit, InputRefusal> {
+        let mut state = self.lock();
+        if state.closed {
+            return Err(InputRefusal::Closed);
+        }
+        if state.items.len() + state.reserved >= self.capacity {
+            return Err(InputRefusal::Full);
+        }
+        state.reserved += 1;
+        Ok(InputPermit {
+            queue: self.clone(),
+            sent: false,
+        })
+    }
+
+    /// Refuses anything further; what is queued can still be read.
+    pub(crate) fn close(&self) {
+        self.lock().closed = true;
+        self.notify.notify_waiters();
+    }
+
+    /// Closes the queue and returns what the executor never read.
+    pub(crate) fn close_and_drain(&self) -> Vec<ClientInput> {
+        let unread = {
+            let mut state = self.lock();
+            state.closed = true;
+            state.items.drain(..).collect()
+        };
+        self.notify.notify_waiters();
+        unread
+    }
+}
+
+/// Room for one message in an [`InputQueue`].
+pub(crate) struct InputPermit {
+    queue: Arc<InputQueue>,
+    sent: bool,
+}
+
+impl InputPermit {
+    pub(crate) fn send(mut self, input: ClientInput) {
+        {
+            let mut state = self.queue.lock();
+            state.reserved -= 1;
+            state.items.push_back(input);
+        }
+        self.sent = true;
+        self.queue.notify.notify_one();
+    }
+}
+
+impl Drop for InputPermit {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.queue.lock().reserved -= 1;
         }
     }
 }
@@ -59,7 +258,7 @@ pub struct ExecutorContext {
     /// stream. Present only when [`AgentExecutor::accepts_live_input`] is true;
     /// the executor reads it alongside its own work, and it ends when the
     /// execution does.
-    pub inputs: Option<tokio::sync::mpsc::Receiver<ClientInput>>,
+    pub inputs: Option<ClientInputs>,
 }
 
 impl ExecutorContext {
@@ -81,7 +280,7 @@ impl ExecutorContext {
         }
     }
 
-    pub fn with_inputs(mut self, inputs: tokio::sync::mpsc::Receiver<ClientInput>) -> Self {
+    pub fn with_inputs(mut self, inputs: ClientInputs) -> Self {
         self.inputs = Some(inputs);
         self
     }

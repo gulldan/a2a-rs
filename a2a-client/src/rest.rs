@@ -4,6 +4,7 @@
 use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use reqwest::Client;
 use serde::Deserialize;
@@ -297,6 +298,7 @@ impl RestTransport {
 
 /// The uplink of a live exchange over REST: each request is a short-lived
 /// `POST /message:live`, which the server answers with the task.
+#[derive(Clone)]
 struct RestLiveUplink {
     transport: RestTransport,
     params: ServiceParams,
@@ -304,14 +306,17 @@ struct RestLiveUplink {
 
 #[async_trait]
 impl crate::LiveUplink for RestLiveUplink {
-    async fn send(&self, request: StreamRequest) -> Result<Option<Task>, A2AError> {
+    async fn send(&self, request: StreamRequest) -> Result<crate::LiveAck, A2AError> {
         match self.transport.post_live(&self.params, &request).await? {
-            StreamOrTask::Task(task) => Ok(Some(*task)),
+            StreamOrTask::Task(task) => Ok(crate::LiveAck::Task(task)),
             // The exchange this was meant for is gone, so the server opened a
-            // new one for it. Nothing here wants that one.
-            StreamOrTask::Stream(_) => Err(A2AError::invalid_request(
-                "the live exchange is no longer open",
-            )),
+            // new one for it and carried the request out: this is that one.
+            StreamOrTask::Stream(events) => {
+                Ok(crate::LiveAck::Reopened(Box::new(crate::LiveConnection {
+                    events,
+                    sender: crate::LiveSender::new(std::sync::Arc::new(self.clone())),
+                })))
+            }
         }
     }
 }
@@ -376,10 +381,16 @@ impl Transport for RestTransport {
                     params: params.clone(),
                 })),
             }),
-            // The task already has an open exchange: this call was input to it.
-            StreamOrTask::Task(_) => Err(A2AError::invalid_request(
-                "a live exchange is already open for this task",
-            )),
+            // The task already has an open exchange (another client's): this
+            // call was input to it and the server carried it out. What it can
+            // give back is the task; its events are on that client's stream.
+            StreamOrTask::Task(task) => Ok(crate::LiveConnection {
+                events: futures::stream::iter([Ok(StreamResponse::Task(*task))]).boxed(),
+                sender: crate::LiveSender::new(std::sync::Arc::new(RestLiveUplink {
+                    transport: self.clone(),
+                    params: params.clone(),
+                })),
+            }),
         }
     }
 

@@ -59,6 +59,42 @@ impl AgentExecutor for LiveAgent {
                     yield Ok(status(&task, &context, TaskState::Completed, "done"));
                     return;
                 }
+                Some("whoami") => {
+                    // Says who the request was made by, then waits for input.
+                    let who = ctx
+                        .service_params
+                        .get("x-user")
+                        .and_then(|values| values.first())
+                        .cloned()
+                        .unwrap_or_default();
+                    yield Ok(status(&task, &context, TaskState::InputRequired, &format!("user: {who}")));
+                    return;
+                }
+                Some("lazy-done") => {
+                    // Like "lazy", but the turn ends with the task completed.
+                    let _inputs = ctx.inputs.take();
+                    yield Ok(status(&task, &context, TaskState::Working, "lazy"));
+                    release.notified().await;
+                    yield Ok(status(&task, &context, TaskState::Completed, "done"));
+                    return;
+                }
+                Some("lazy-err") => {
+                    // Like "lazy", but the turn ends with an error.
+                    let _inputs = ctx.inputs.take();
+                    yield Ok(status(&task, &context, TaskState::Working, "lazy"));
+                    release.notified().await;
+                    yield Err(A2AError::internal("agent failed"));
+                    return;
+                }
+                Some("lazy") => {
+                    // Takes input in principle, but never reads it, and ends its
+                    // turn when released.
+                    let _inputs = ctx.inputs.take();
+                    yield Ok(status(&task, &context, TaskState::Working, "lazy"));
+                    release.notified().await;
+                    yield Ok(status(&task, &context, TaskState::InputRequired, "done lazily"));
+                    return;
+                }
                 _ => {}
             }
             yield Ok(status(&task, &context, TaskState::Working, "working"));
@@ -108,8 +144,10 @@ fn handler(takes_input: bool) -> (Arc<DefaultRequestHandler>, Arc<Notify>) {
     )
     .with_capabilities(AgentCapabilities {
         streaming: Some(true),
+        user_artifacts: Some(true),
         ..AgentCapabilities::default()
-    });
+    })
+    .with_push_config_store(a2a_server::InMemoryPushConfigStore::new());
     (Arc::new(handler), release)
 }
 
@@ -416,14 +454,15 @@ async fn a_1_0_client_is_not_sent_message_updates() {
         .await
         .unwrap();
     let task_id = task_of(next(&mut down).await).id;
-    next(&mut down).await; // working
+    let working = generation_of(&next(&mut down).await);
 
     up.send(send("hello", Some(&task_id))).await.unwrap();
 
     // The agent's answer comes; the append is not announced, which shows only
-    // as a gap in the generations.
+    // as a gap in the generations (the message took the one in between).
     let answer = next(&mut down).await;
     assert_eq!(state_text(&answer).1, "got: hello");
+    assert_eq!(generation_of(&answer), working + 2);
     up.send(send("finish", Some(&task_id))).await.unwrap();
     assert_eq!(state_text(&next(&mut down).await).0, TaskState::Completed);
 }
@@ -652,4 +691,930 @@ async fn a_handler_that_does_not_override_the_live_methods_refuses_them() {
         .err()
         .unwrap();
     assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+}
+
+// ---------------------------------------------------------------------------
+// Regressions found in the live-message validation
+// ---------------------------------------------------------------------------
+
+fn artifact_update(task_id: &str, artifact_id: &str) -> a2a::event::TaskArtifactUpdateEvent {
+    a2a::event::TaskArtifactUpdateEvent {
+        task_id: task_id.into(),
+        context_id: String::new(),
+        artifact: Artifact {
+            artifact_id: artifact_id.into(),
+            name: None,
+            description: None,
+            parts: vec![Part::text("from the client")],
+            metadata: None,
+            extensions: None,
+            start_generation: None,
+            end_generation: None,
+            role: None,
+        },
+        append: None,
+        last_chunk: Some(true),
+        metadata: None,
+        generation: 0,
+    }
+}
+
+fn cancel(id: &str) -> CancelTaskRequest {
+    CancelTaskRequest {
+        id: id.into(),
+        metadata: None,
+        tenant: None,
+    }
+}
+
+#[tokio::test]
+async fn an_idle_exchange_is_told_when_its_task_is_canceled_and_ends() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (up, uplink) = new_uplink();
+    up.send(send("ask", None)).await.unwrap();
+    let mut down = handler.send_live_message(&p, uplink).await.unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    assert_eq!(
+        state_text(&next(&mut down).await).0,
+        TaskState::InputRequired
+    );
+
+    // Nothing is running; somebody else cancels the task.
+    handler.cancel_task(&p, cancel(&task_id)).await.unwrap();
+
+    let told = task_of(next(&mut down).await);
+    assert_eq!(told.status.state, TaskState::Canceled);
+    ended(&mut down).await;
+}
+
+#[tokio::test]
+async fn an_idle_exchange_follows_a_turn_another_client_starts() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (up, uplink) = new_uplink();
+    up.send(send("ask", None)).await.unwrap();
+    let mut owner = handler.send_live_message(&p, uplink).await.unwrap();
+    let task_id = task_of(next(&mut owner).await).id;
+    next(&mut owner).await; // INPUT_REQUIRED
+
+    // A second client attaches to the idle task...
+    let (watch_up, watch_uplink) = new_uplink();
+    watch_up.send(subscribe(&task_id, None)).await.unwrap();
+    let mut watcher = handler.send_live_message(&p, watch_uplink).await.unwrap();
+    assert_eq!(
+        task_of(next(&mut watcher).await).status.state,
+        TaskState::InputRequired
+    );
+
+    // ...and a third continues the task, without a live exchange of its own.
+    let mut turn = handler
+        .send_streaming_message(
+            &p,
+            match send("quick", Some(&task_id)).payload {
+                StreamRequestPayload::SendMessage(request) => request,
+                _ => unreachable!(),
+            },
+        )
+        .await
+        .unwrap();
+    while turn.next().await.is_some() {}
+
+    // Both exchanges heard about it, and both ended with the task.
+    for down in [&mut owner, &mut watcher] {
+        let mut ended_task = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), down.next())
+                .await
+                .expect("the exchange ends")
+            {
+                Some(Ok(StreamResponse::Task(task)))
+                    if task.status.state == TaskState::Completed =>
+                {
+                    ended_task = true;
+                }
+                Some(Ok(StreamResponse::StatusUpdate(update)))
+                    if update.status.state == TaskState::Completed =>
+                {
+                    ended_task = true;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("{error:?}"),
+                None => break,
+            }
+        }
+        assert!(ended_task, "the exchange was told the task completed");
+    }
+}
+
+#[tokio::test]
+async fn input_the_agent_never_read_is_answered_with_a_stream_error_not_silence() {
+    let (handler, release) = handler(true);
+    let (up, uplink) = new_uplink();
+    up.send(send("lazy", None)).await.unwrap();
+    let mut down = handler
+        .send_live_message(&params("1.1"), uplink)
+        .await
+        .unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    assert_eq!(state_text(&next(&mut down).await).1, "lazy");
+
+    let mut ids = Vec::new();
+    for text in ["x", "y"] {
+        let request = send(text, Some(&task_id));
+        if let StreamRequestPayload::SendMessage(r) = &request.payload {
+            ids.push(r.message.message_id.clone());
+        }
+        up.send(request).await.unwrap();
+        assert!(matches!(
+            next(&mut down).await,
+            StreamResponse::MessageUpdate(_)
+        ));
+    }
+    release.notify_one();
+
+    // The turn ends without reading either: each sender is told so.
+    let mut told = Vec::new();
+    let mut ended_turn = false;
+    while told.len() < 2 || !ended_turn {
+        match next(&mut down).await {
+            StreamResponse::Error(error) => {
+                assert_eq!(error.code, "UNAVAILABLE");
+                told.push(error.reference_id.expect("it names the message"));
+            }
+            StreamResponse::StatusUpdate(update)
+                if update.status.state == TaskState::InputRequired =>
+            {
+                ended_turn = true;
+            }
+            _ => {}
+        }
+    }
+    told.sort();
+    ids.sort();
+    assert_eq!(told, ids);
+}
+
+#[tokio::test]
+async fn an_artifact_only_request_to_an_idle_task_announces_its_artifact_not_an_old_message() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (up, uplink) = new_uplink();
+    up.send(send("ask", None)).await.unwrap();
+    let mut down = handler.send_live_message(&p, uplink).await.unwrap();
+    let opening = task_of(next(&mut down).await);
+    next(&mut down).await; // INPUT_REQUIRED
+
+    let mut request = send("", None);
+    if let StreamRequestPayload::SendMessage(r) = &mut request.payload {
+        r.message.message_id = String::new();
+        r.message.parts.clear();
+        r.artifact_updates = vec![artifact_update(&opening.id, "from-client")];
+    }
+    up.send(request).await.unwrap();
+
+    let mut generations = Vec::new();
+    let mut announced_artifact = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), down.next())
+            .await
+            .expect("an event arrives")
+            .expect("open")
+            .expect("no error")
+        {
+            StreamResponse::MessageUpdate(update) => {
+                panic!("an artifact-only request has no message to announce: {update:?}")
+            }
+            StreamResponse::ArtifactUpdate(update) => {
+                announced_artifact = true;
+                generations.push(update.generation);
+            }
+            StreamResponse::StatusUpdate(update) => {
+                generations.push(update.generation);
+                // The turn the request started has begun.
+                if announced_artifact {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(announced_artifact, "the artifact was announced");
+    assert!(
+        generations.windows(2).all(|pair| pair[1] > pair[0]),
+        "no generation repeats: {generations:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_call_routed_into_an_exchange_is_served_as_its_own_caller() {
+    let (handler, _) = handler(true);
+    let alice = {
+        let mut p = params("1.1");
+        p.insert("x-user".into(), vec!["alice".into()]);
+        p
+    };
+    let bob = {
+        let mut p = params("1.1");
+        p.insert("x-user".into(), vec!["bob".into()]);
+        p
+    };
+    let LiveResponse::Stream(mut down) = handler
+        .send_live_request(&alice, send("ask", None))
+        .await
+        .unwrap()
+    else {
+        panic!("the first call is the downlink");
+    };
+    let task_id = task_of(next(&mut down).await).id;
+    next(&mut down).await; // INPUT_REQUIRED
+
+    let LiveResponse::Ack(_) = handler
+        .send_live_request(&bob, send("whoami", Some(&task_id)))
+        .await
+        .unwrap()
+    else {
+        panic!("a later call is acknowledged");
+    };
+
+    let mut said = String::new();
+    while !said.starts_with("user:") {
+        if let StreamResponse::StatusUpdate(update) = next(&mut down).await {
+            said = update
+                .status
+                .message
+                .as_ref()
+                .and_then(|m| m.text())
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+    assert_eq!(
+        said, "user: bob",
+        "the turn ran as the caller who started it"
+    );
+}
+
+#[tokio::test]
+async fn a_call_after_the_exchange_ended_opens_a_new_one_and_applies_the_message_once() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let LiveResponse::Stream(mut down) = handler
+        .send_live_request(&p, send("ask", None))
+        .await
+        .unwrap()
+    else {
+        panic!("the first call is the downlink");
+    };
+    let task_id = task_of(next(&mut down).await).id;
+    next(&mut down).await; // INPUT_REQUIRED
+    drop(down); // the client goes away; the exchange ends
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let reply = handler
+        .send_live_request(&p, send("quick", Some(&task_id)))
+        .await
+        .unwrap();
+
+    // There was no exchange left to route to, so this call opened one.
+    let LiveResponse::Stream(mut reopened) = reply else {
+        panic!("a new exchange was opened");
+    };
+    assert!(matches!(next(&mut reopened).await, StreamResponse::Task(_)));
+    let stored = handler
+        .get_task(
+            &ServiceParams::new(),
+            GetTaskRequest {
+                id: task_id,
+                history_length: None,
+                tenant: None,
+                timeline_length: None,
+                current_generation: None,
+            },
+        )
+        .await
+        .unwrap();
+    let quick = stored
+        .timeline
+        .iter()
+        .flatten()
+        .filter(|entry| matches!(&entry.content, TimelineContent::Message(m) if m.text() == Some("quick")))
+        .count();
+    assert_eq!(quick, 1, "the message was applied exactly once");
+}
+
+#[tokio::test]
+async fn a_push_configuration_sent_with_a_message_to_a_running_task_is_registered() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (up, uplink) = new_uplink();
+    up.send(send("start", None)).await.unwrap();
+    let mut down = handler.send_live_message(&p, uplink).await.unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    next(&mut down).await; // working
+
+    let mut request = send("hello", Some(&task_id));
+    if let StreamRequestPayload::SendMessage(r) = &mut request.payload {
+        r.configuration = Some(SendMessageConfiguration {
+            accepted_output_modes: None,
+            task_push_notification_config: Some(TaskPushNotificationConfig {
+                url: "https://example.com/hook".into(),
+                id: Some("hook-1".into()),
+                task_id: String::new(),
+                token: None,
+                authentication: None,
+                tenant: None,
+                protocol_version: None,
+            }),
+            history_length: None,
+            timeline_length: None,
+            return_immediately: None,
+            if_generation_match: None,
+        });
+    }
+    up.send(request).await.unwrap();
+    assert!(matches!(
+        next(&mut down).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+
+    let configs = handler
+        .list_push_configs(
+            &p,
+            ListTaskPushNotificationConfigsRequest {
+                task_id,
+                page_size: None,
+                page_token: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(configs.configs.len(), 1);
+    assert_eq!(configs.configs[0].url, "https://example.com/hook");
+}
+
+#[tokio::test]
+async fn subscribing_to_an_idle_task_at_its_current_generation_opens_without_a_snapshot() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (up, uplink) = new_uplink();
+    up.send(send("ask", None)).await.unwrap();
+    let mut owner = handler.send_live_message(&p, uplink).await.unwrap();
+    let task_id = task_of(next(&mut owner).await).id;
+    let idle = next(&mut owner).await;
+    let current = generation_of(&idle);
+
+    let (watch_up, watch_uplink) = new_uplink();
+    watch_up
+        .send(subscribe(&task_id, Some(current)))
+        .await
+        .unwrap();
+    let mut watcher = handler.send_live_message(&p, watch_uplink).await.unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), watcher.next())
+            .await
+            .is_err(),
+        "a client that holds the current generation is sent nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_artifact_update_without_an_id_is_refused() {
+    let (handler, _) = handler(true);
+    let (up, uplink) = new_uplink();
+    up.send(send("start", None)).await.unwrap();
+    let mut down = handler
+        .send_live_message(&params("1.1"), uplink)
+        .await
+        .unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    next(&mut down).await; // working
+
+    let mut request = send("hello", Some(&task_id));
+    if let StreamRequestPayload::SendMessage(r) = &mut request.payload {
+        r.artifact_updates = vec![artifact_update(&task_id, "")];
+    }
+    up.send(request).await.unwrap();
+
+    match next(&mut down).await {
+        StreamResponse::Error(error) => assert_eq!(error.code, "INVALID_ARGUMENT"),
+        other => panic!("expected a StreamError, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regressions found in the second live-message validation
+// ---------------------------------------------------------------------------
+
+fn text_message_id(request: &StreamRequest) -> String {
+    match &request.payload {
+        StreamRequestPayload::SendMessage(r) => r.message.message_id.clone(),
+        _ => unreachable!(),
+    }
+}
+
+fn applied(task: &Task, text: &str) -> usize {
+    task.timeline
+        .iter()
+        .flatten()
+        .filter(
+            |entry| matches!(&entry.content, TimelineContent::Message(m) if m.text() == Some(text)),
+        )
+        .count()
+}
+
+/// An HTTP call that races the end of its exchange is either carried out (and
+/// then acknowledged with the message in the task) or told it was not reached
+/// and so opens a new exchange that carries it out; it never hangs, and is
+/// never acknowledged without having been carried out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_call_racing_the_end_of_its_exchange_is_never_lost_or_left_waiting() {
+    for round in 0..200 {
+        let (handler, _) = handler(true);
+        let p = params("1.1");
+        let LiveResponse::Stream(mut down) = handler
+            .send_live_request(&p, send("ask", None))
+            .await
+            .unwrap()
+        else {
+            panic!("the first call is the downlink");
+        };
+        let task_id = task_of(next(&mut down).await).id;
+        next(&mut down).await; // INPUT_REQUIRED
+
+        let marker = format!("race-{round}");
+        let caller = {
+            let handler = handler.clone();
+            let p = p.clone();
+            let task_id = task_id.clone();
+            let marker = marker.clone();
+            tokio::spawn(async move {
+                handler
+                    .send_live_request(&p, send(&marker, Some(&task_id)))
+                    .await
+            })
+        };
+        // The exchange ends as the call is on its way.
+        if round % 2 == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(down);
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), caller)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the call hung"))
+            .unwrap()
+            .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+        // Whichever way it went, the message was applied exactly once.
+        match reply {
+            LiveResponse::Ack(task) => {
+                assert_eq!(
+                    applied(&task, &marker),
+                    1,
+                    "round {round}: acked, not applied"
+                );
+            }
+            LiveResponse::Stream(mut reopened) => {
+                assert!(matches!(next(&mut reopened).await, StreamResponse::Task(_)));
+            }
+            _ => panic!("unexpected reply"),
+        }
+        let stored = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                    timeline_length: None,
+                    current_generation: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied(&stored, &marker), 1, "round {round}");
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_call_is_still_acknowledged_when_the_downlink_is_gone() {
+    // A message the agent declines is a rejection; the exchange's downlink is
+    // dropped meanwhile. The HTTP caller must still get its answer.
+    let (handler, release) = handler(false);
+    let p = params("1.1");
+    let LiveResponse::Stream(mut down) = handler
+        .send_live_request(&p, send("start", None))
+        .await
+        .unwrap()
+    else {
+        panic!("the first call is the downlink");
+    };
+    let task_id = task_of(next(&mut down).await).id;
+    next(&mut down).await; // working
+
+    let caller = {
+        let handler = handler.clone();
+        let p = p.clone();
+        let task_id = task_id.clone();
+        tokio::spawn(async move {
+            handler
+                .send_live_request(&p, send("declined", Some(&task_id)))
+                .await
+        })
+    };
+    drop(down);
+
+    let reply = tokio::time::timeout(Duration::from_secs(5), caller)
+        .await
+        .expect("the call is answered")
+        .unwrap();
+    // Routed into the exchange: acknowledged. Arriving after it ended: the call
+    // opens a new exchange, which declines the message as an error. Either way
+    // it is answered.
+    match reply {
+        Ok(LiveResponse::Ack(_)) => {}
+        Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
+        other => panic!("unexpected reply: {:?}", other.map(|_| ())),
+    }
+    release.notify_one();
+}
+
+#[tokio::test]
+async fn input_unread_when_the_turn_ends_terminally_is_answered_before_the_end() {
+    let (handler, release) = handler(true);
+    let (up, uplink) = new_uplink();
+    up.send(send("lazy-done", None)).await.unwrap();
+    let mut down = handler
+        .send_live_message(&params("1.1"), uplink)
+        .await
+        .unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    assert_eq!(state_text(&next(&mut down).await).1, "lazy");
+
+    let request = send("unread", Some(&task_id));
+    let message_id = text_message_id(&request);
+    up.send(request).await.unwrap();
+    assert!(matches!(
+        next(&mut down).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+    release.notify_one();
+
+    // The turn completes without reading it: the error comes first, then the end.
+    match next(&mut down).await {
+        StreamResponse::Error(error) => {
+            assert_eq!(error.code, "UNAVAILABLE");
+            assert_eq!(error.reference_id.as_deref(), Some(message_id.as_str()));
+        }
+        other => panic!("expected the unread message to be answered, got {other:?}"),
+    }
+    assert_eq!(state_text(&next(&mut down).await).0, TaskState::Completed);
+    ended(&mut down).await;
+}
+
+#[tokio::test]
+async fn input_unread_when_the_task_is_canceled_is_answered_before_the_end() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (up, uplink) = new_uplink();
+    up.send(send("lazy", None)).await.unwrap();
+    let mut down = handler.send_live_message(&p, uplink).await.unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    assert_eq!(state_text(&next(&mut down).await).1, "lazy");
+
+    let request = send("unread", Some(&task_id));
+    let message_id = text_message_id(&request);
+    up.send(request).await.unwrap();
+    assert!(matches!(
+        next(&mut down).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+
+    handler.cancel_task(&p, cancel(&task_id)).await.unwrap();
+
+    let mut answered = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), down.next())
+            .await
+            .expect("the exchange ends")
+        {
+            Some(Ok(StreamResponse::Error(error))) => {
+                assert_eq!(error.reference_id.as_deref(), Some(message_id.as_str()));
+                answered = true;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(error)) => panic!("{error:?}"),
+            None => break,
+        }
+    }
+    assert!(answered, "the unread message was answered before the end");
+}
+
+#[tokio::test]
+async fn an_ordinary_streaming_subscriber_is_not_told_about_a_live_clients_unread_message() {
+    let (handler, release) = handler(true);
+    let p = params("1.1");
+    let (up, uplink) = new_uplink();
+    up.send(send("lazy", None)).await.unwrap();
+    let mut down = handler.send_live_message(&p, uplink).await.unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    next(&mut down).await; // lazy
+
+    // An ordinary 1.1 subscription to the same task.
+    let mut plain = handler
+        .subscribe_to_task(
+            &p,
+            SubscribeToTaskRequest {
+                id: task_id.clone(),
+                tenant: None,
+                last_seen_generation: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        plain.next().await,
+        Some(Ok(StreamResponse::Task(_)))
+    ));
+
+    up.send(send("unread", Some(&task_id))).await.unwrap();
+    assert!(matches!(
+        next(&mut down).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+    release.notify_one();
+    loop {
+        // The turn's last status first, then what it never read.
+        if matches!(next(&mut down).await, StreamResponse::Error(_)) {
+            break;
+        }
+    }
+
+    // The live exchange heard the error; the plain stream heard only events.
+    let mut seen_error = false;
+    while let Ok(Some(item)) = tokio::time::timeout(Duration::from_millis(500), plain.next()).await
+    {
+        if matches!(item, Ok(StreamResponse::Error(_))) {
+            seen_error = true;
+        }
+    }
+    assert!(!seen_error, "a live-only error reached an ordinary stream");
+}
+
+#[tokio::test]
+async fn a_rejection_does_not_overtake_the_events_of_an_earlier_request() {
+    let (handler, _) = handler(true);
+    let (up, uplink) = new_uplink();
+    up.send(send("start", None)).await.unwrap();
+    let mut down = handler
+        .send_live_message(&params("1.1"), uplink)
+        .await
+        .unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    next(&mut down).await; // working
+
+    // An accepted message and, straight after, one that is refused.
+    up.send(send("hello", Some(&task_id))).await.unwrap();
+    up.send(send("elsewhere", Some("some-other-task")))
+        .await
+        .unwrap();
+
+    let first = next(&mut down).await;
+    assert!(
+        matches!(first, StreamResponse::MessageUpdate(_)),
+        "the accepted message is announced first: {first:?}"
+    );
+    // Then its answer and the rejection, in whichever order they happen, but
+    // the rejection never before the announcement.
+    let mut saw_error = false;
+    for _ in 0..2 {
+        if let StreamResponse::Error(error) = next(&mut down).await {
+            assert_eq!(error.code, "INVALID_ARGUMENT");
+            saw_error = true;
+        }
+    }
+    assert!(saw_error);
+}
+
+#[tokio::test]
+async fn closing_the_input_sender_keeps_what_was_queued_and_dropping_it_ends_the_queue() {
+    use a2a_server::{ClientInput, ClientInputs};
+    let message =
+        |text: &str| ClientInput::new(Message::new(Role::User, vec![Part::text(text)]), 1);
+
+    let (sender, mut inputs) = ClientInputs::channel(4);
+    sender.try_send(message("a")).map_err(|_| ()).unwrap();
+    sender.try_send(message("b")).map_err(|_| ()).unwrap();
+    sender.close();
+    assert!(
+        sender.try_send(message("late")).is_err(),
+        "closed queues refuse"
+    );
+    assert_eq!(inputs.recv().await.unwrap().message.text(), Some("a"));
+    assert_eq!(inputs.recv().await.unwrap().message.text(), Some("b"));
+    assert!(inputs.recv().await.is_none(), "then it ends");
+
+    let (sender, mut inputs) = ClientInputs::channel(4);
+    sender.try_send(message("only")).map_err(|_| ()).unwrap();
+    drop(sender);
+    assert_eq!(inputs.recv().await.unwrap().message.text(), Some("only"));
+    let end = tokio::time::timeout(Duration::from_secs(2), inputs.recv()).await;
+    assert!(
+        matches!(end, Ok(None)),
+        "dropping every sender ends the queue"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regressions found in the third live-message validation
+// ---------------------------------------------------------------------------
+
+/// A store that can be told to fail the next `begin_cancel` or to panic in the
+/// next `get`.
+#[derive(Clone, Default)]
+struct FlakyStore {
+    inner: Arc<InMemoryTaskStore>,
+    fail_cancel: Arc<std::sync::atomic::AtomicBool>,
+    panic_get: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl a2a_server::TaskStore for FlakyStore {
+    async fn create(&self, task: Task) -> Result<a2a_server::task_store::TaskVersion, A2AError> {
+        self.inner.create(task).await
+    }
+    async fn update(&self, task: Task) -> Result<a2a_server::task_store::TaskVersion, A2AError> {
+        self.inner.update(task).await
+    }
+    async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
+        if self
+            .panic_get
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("the store panicked");
+        }
+        self.inner.get(task_id).await
+    }
+    async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+        self.inner.list(req).await
+    }
+    async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
+        if self
+            .fail_cancel
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(A2AError::internal("store is down"));
+        }
+        self.inner.begin_cancel(task_id).await
+    }
+}
+
+fn flaky_handler() -> (Arc<DefaultRequestHandler>, FlakyStore) {
+    let store = FlakyStore::default();
+    let handler = DefaultRequestHandler::new(
+        LiveAgent {
+            takes_input: true,
+            release: Arc::new(Notify::new()),
+        },
+        store.clone(),
+    )
+    .with_capabilities(AgentCapabilities {
+        streaming: Some(true),
+        user_artifacts: Some(true),
+        ..AgentCapabilities::default()
+    });
+    (Arc::new(handler), store)
+}
+
+/// A cancel the store refuses changes nothing: the agent still takes input.
+#[tokio::test]
+async fn a_cancel_the_store_refuses_does_not_close_the_agents_input() {
+    let (handler, store) = flaky_handler();
+    let p = params("1.1");
+    let (up, uplink) = new_uplink();
+    up.send(send("work", None)).await.unwrap();
+    let mut down = handler.send_live_message(&p, uplink).await.unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    assert_eq!(state_text(&next(&mut down).await).1, "working");
+
+    store
+        .fail_cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    handler
+        .cancel_task(&p, cancel(&task_id))
+        .await
+        .expect_err("the store refused the cancel");
+
+    up.send(send("ping", Some(&task_id))).await.unwrap();
+    loop {
+        match next(&mut down).await {
+            StreamResponse::Error(error) => panic!("the input was refused: {error:?}"),
+            event => {
+                if state_text_opt(&event).is_some_and(|(_, text)| text == "got: ping") {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn state_text_opt(event: &StreamResponse) -> Option<(TaskState, String)> {
+    match event {
+        StreamResponse::StatusUpdate(update) => Some((
+            update.status.state.clone(),
+            update
+                .status
+                .message
+                .as_ref()
+                .and_then(|m| m.text())
+                .unwrap_or("")
+                .to_owned(),
+        )),
+        _ => None,
+    }
+}
+
+/// When the agent's stream ends with an error, what it never read is answered
+/// first, then the error ends the exchange.
+#[tokio::test]
+async fn input_unread_when_the_agent_fails_is_answered_before_the_error() {
+    let (handler, release) = handler(true);
+    let (up, uplink) = new_uplink();
+    up.send(send("lazy-err", None)).await.unwrap();
+    let mut down = handler
+        .send_live_message(&params("1.1"), uplink)
+        .await
+        .unwrap();
+    let task_id = task_of(next(&mut down).await).id;
+    assert_eq!(state_text(&next(&mut down).await).1, "lazy");
+
+    let request = send("unread", Some(&task_id));
+    let message_id = text_message_id(&request);
+    up.send(request).await.unwrap();
+    assert!(matches!(
+        next(&mut down).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+    release.notify_one();
+
+    match next(&mut down).await {
+        StreamResponse::Error(error) => {
+            assert_eq!(error.reference_id.as_deref(), Some(message_id.as_str()));
+        }
+        other => panic!("expected the unread message to be answered, got {other:?}"),
+    }
+}
+
+/// A panic while a call is being handled never leaves a call acknowledged
+/// without having been carried out, or waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_panic_while_handling_a_call_never_loses_or_hangs_the_calls_queued_behind_it() {
+    for round in 0..30 {
+        let (handler, store) = flaky_handler();
+        let p = params("1.1");
+        let LiveResponse::Stream(mut down) = handler
+            .send_live_request(&p, send("ask", None))
+            .await
+            .unwrap()
+        else {
+            panic!("the first call is the downlink");
+        };
+        let task_id = task_of(next(&mut down).await).id;
+        next(&mut down).await; // INPUT_REQUIRED
+
+        store
+            .panic_get
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut callers = Vec::new();
+        for i in 0..6 {
+            let handler = handler.clone();
+            let p = p.clone();
+            let task_id = task_id.clone();
+            let marker = format!("panic-{round}-{i}");
+            callers.push((
+                marker.clone(),
+                tokio::spawn(async move {
+                    handler
+                        .send_live_request(&p, send(&marker, Some(&task_id)))
+                        .await
+                }),
+            ));
+        }
+        for (marker, caller) in callers {
+            let reply = tokio::time::timeout(Duration::from_secs(5), caller)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: {marker} hung"));
+            // The call that hit the panic itself may fail; the others may not
+            // be acknowledged unless they were carried out.
+            if let Ok(Ok(LiveResponse::Ack(task))) = reply {
+                assert_eq!(
+                    applied(&task, &marker),
+                    1,
+                    "round {round}: {marker} acked, not applied"
+                );
+            }
+        }
+    }
 }

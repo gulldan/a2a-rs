@@ -210,6 +210,7 @@ impl JsonRpcTransport {
 
 /// The uplink of a live exchange over JSON-RPC: each request is a short-lived
 /// call to the same method, which the server answers with the task.
+#[derive(Clone)]
 struct JsonRpcLiveUplink {
     transport: JsonRpcTransport,
     params: ServiceParams,
@@ -217,20 +218,23 @@ struct JsonRpcLiveUplink {
 
 #[async_trait]
 impl crate::LiveUplink for JsonRpcLiveUplink {
-    async fn send(&self, request: StreamRequest) -> Result<Option<Task>, A2AError> {
+    async fn send(&self, request: StreamRequest) -> Result<crate::LiveAck, A2AError> {
         match self
             .transport
             .call_stream_or_result(&self.params, methods::SEND_LIVE_MESSAGE, &request)
             .await?
         {
             StreamOrResult::Result(result) => protojson_conv::from_value(result)
-                .map(Some)
+                .map(|task| crate::LiveAck::Task(Box::new(task)))
                 .map_err(|e| A2AError::internal(format!("failed to deserialize result: {e}"))),
             // The exchange this was meant for is gone, so the server opened a
-            // new one for it. Nothing here wants that one.
-            StreamOrResult::Stream(_) => Err(A2AError::invalid_request(
-                "the live exchange is no longer open",
-            )),
+            // new one for it and carried the request out: this is that one.
+            StreamOrResult::Stream(events) => {
+                Ok(crate::LiveAck::Reopened(Box::new(crate::LiveConnection {
+                    events,
+                    sender: crate::LiveSender::new(std::sync::Arc::new(self.clone())),
+                })))
+            }
         }
     }
 }
@@ -520,10 +524,21 @@ impl Transport for JsonRpcTransport {
                     params: params.clone(),
                 })),
             }),
-            // The task already has an open exchange: this call was input to it.
-            StreamOrResult::Result(_) => Err(A2AError::invalid_request(
-                "a live exchange is already open for this task",
-            )),
+            // The task already has an open exchange (another client's): this
+            // call was input to it and the server carried it out. What it can
+            // give back is the task; its events are on that client's stream.
+            StreamOrResult::Result(result) => {
+                let task: Task = protojson_conv::from_value(result).map_err(|e| {
+                    A2AError::internal(format!("failed to deserialize result: {e}"))
+                })?;
+                Ok(crate::LiveConnection {
+                    events: futures::stream::iter([Ok(StreamResponse::Task(task))]).boxed(),
+                    sender: crate::LiveSender::new(std::sync::Arc::new(JsonRpcLiveUplink {
+                        transport: self.clone(),
+                        params: params.clone(),
+                    })),
+                })
+            }
         }
     }
 

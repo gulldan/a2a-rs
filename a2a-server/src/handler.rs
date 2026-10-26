@@ -8,7 +8,7 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Notify, RwLock, broadcast, mpsc, oneshot};
 
-use crate::executor::ClientInput;
+use crate::executor::{ClientInputs, InputQueue};
 use crate::middleware::ServiceParams;
 use crate::pagination::resolve_page_size;
 use crate::task_store::{apply_history_length, apply_timeline_length};
@@ -42,10 +42,20 @@ const LONG_POLL_RECHECK: Duration = Duration::from_secs(1);
 struct ExecutionEvent {
     sequence: u64,
     result: Result<StreamResponse, A2AError>,
-    /// A `Task` snapshot that changed nothing. It sits at a generation that
-    /// was already announced, so streams meant for clients leave it out; the
+    kind: EventKind,
+}
+
+/// How an event is meant to be delivered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    Normal,
+    /// A `Task` snapshot that changed nothing. It sits at a generation that was
+    /// already announced, so streams meant for clients leave it out; the
     /// blocking send, which only needs to know the executor spoke, keeps it.
-    repeated: bool,
+    Repeated,
+    /// Something only a live exchange is told (a `StreamError` about a message
+    /// of its own), not the other subscribers of the task.
+    LiveOnly,
 }
 
 #[derive(Default)]
@@ -69,7 +79,7 @@ struct ActiveExecution {
     writer: Arc<tokio::sync::Mutex<()>>,
     /// Where live client messages go while the executor runs; set once, when
     /// the executor accepts live input.
-    inputs: std::sync::OnceLock<tokio::sync::mpsc::Sender<ClientInput>>,
+    inputs: std::sync::OnceLock<Arc<InputQueue>>,
 }
 
 impl ActiveExecution {
@@ -114,7 +124,8 @@ impl ActiveExecution {
         result: Result<&StreamResponse, &A2AError>,
         snapshot_task: Option<Task>,
     ) {
-        self.publish_marked(result, snapshot_task, false).await;
+        self.publish_kind(result, snapshot_task, EventKind::Normal)
+            .await;
     }
 
     async fn publish_marked(
@@ -122,6 +133,20 @@ impl ActiveExecution {
         result: Result<&StreamResponse, &A2AError>,
         snapshot_task: Option<Task>,
         repeated: bool,
+    ) {
+        let kind = if repeated {
+            EventKind::Repeated
+        } else {
+            EventKind::Normal
+        };
+        self.publish_kind(result, snapshot_task, kind).await;
+    }
+
+    async fn publish_kind(
+        &self,
+        result: Result<&StreamResponse, &A2AError>,
+        snapshot_task: Option<Task>,
+        kind: EventKind,
     ) {
         let sequence = {
             let mut state = self.state.write().await;
@@ -141,7 +166,7 @@ impl ActiveExecution {
         let event = ExecutionEvent {
             sequence,
             result: result.cloned().map_err(Clone::clone),
-            repeated,
+            kind,
         };
         let _ = self.sender.send(event);
     }
@@ -589,6 +614,11 @@ fn apply_client_artifacts(
 ) -> Result<Vec<TaskArtifactUpdateEvent>, A2AError> {
     let mut applied = Vec::with_capacity(req.artifact_updates.len());
     for update in &req.artifact_updates {
+        if update.artifact.artifact_id.is_empty() {
+            return Err(A2AError::invalid_params(
+                "an artifact update needs an artifactId",
+            ));
+        }
         let mut update = update.clone();
         if !new_task {
             if !update.task_id.is_empty() && update.task_id != task.id {
@@ -632,7 +662,14 @@ fn apply_client_artifacts(
 
 /// Records a follow-up client message in the task's timeline, then applies
 /// the artifacts sent with it (A2A 1.1 §3.4: the message first).
-fn record_client_input(task: &mut Task, req: &SendMessageRequest) -> Result<(), A2AError> {
+///
+/// Returns the events that describe what was recorded, in order, for a live
+/// stream to announce: the message as it was appended, then each artifact.
+fn record_client_input(
+    task: &mut Task,
+    req: &SendMessageRequest,
+) -> Result<Vec<StreamResponse>, A2AError> {
+    let mut events = Vec::new();
     if !is_artifact_only(req) {
         task.generation += 1;
         task.timeline
@@ -641,8 +678,26 @@ fn record_client_input(task: &mut Task, req: &SendMessageRequest) -> Result<(), 
                 content: TimelineContent::Message(req.message.clone()),
                 generation: task.generation,
             });
+        events.push(client_message_event(task, &req.message));
     }
-    apply_client_artifacts(task, req, false).map(|_| ())
+    events.extend(
+        apply_client_artifacts(task, req, false)?
+            .into_iter()
+            .map(StreamResponse::ArtifactUpdate),
+    );
+    Ok(events)
+}
+
+/// The event that announces a client message appended to `task` at its current
+/// generation.
+fn client_message_event(task: &Task, message: &Message) -> StreamResponse {
+    StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+        task_id: task.id.clone(),
+        context_id: task.context_id.clone(),
+        message: message.clone(),
+        metadata: None,
+        generation: task.generation,
+    })
 }
 
 /// Where a cancellation stands while its executor's events are applied.
@@ -877,6 +932,7 @@ fn subscription_stream(
     min_sequence: u64,
     include_repeats: bool,
     message_updates: bool,
+    live: bool,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
     Box::pin(futures::stream::unfold(
         SubscriptionState {
@@ -900,7 +956,11 @@ fn subscription_stream(
             loop {
                 match state.receiver.recv().await {
                     Ok(event) if event.sequence <= state.min_sequence => continue,
-                    Ok(event) if event.repeated && !include_repeats => {
+                    Ok(event) if event.kind == EventKind::Repeated && !include_repeats => {
+                        state.min_sequence = event.sequence;
+                        continue;
+                    }
+                    Ok(event) if event.kind == EventKind::LiveOnly && !live => {
                         state.min_sequence = event.sequence;
                         continue;
                     }
@@ -969,6 +1029,11 @@ async fn drive_execution(
                     {
                         None
                     } else {
+                        // A terminal event ends every stream; what the executor
+                        // never read is answered before it, not after.
+                        if is_terminal_event(&event) {
+                            reject_unread_inputs_locked(&active, &task_id).await;
+                        }
                         match apply_and_publish(
                             runtime.task_store.as_ref(),
                             &active,
@@ -982,6 +1047,7 @@ async fn drive_execution(
                                 Some(published)
                             }
                             Err(error) => {
+                                reject_unread_inputs_locked(&active, &task_id).await;
                                 active.publish(Err(&error), None).await;
                                 None
                             }
@@ -1002,7 +1068,7 @@ async fn drive_execution(
                 )
                 .await
                 {
-                    publish_error(&active, &error).await;
+                    fail_execution(&active, &task_id, &error).await;
                     break;
                 }
                 if is_terminal_event(&event) {
@@ -1010,14 +1076,58 @@ async fn drive_execution(
                 }
             }
             Err(error) => {
-                publish_error(&active, &error).await;
+                fail_execution(&active, &task_id, &error).await;
                 break;
             }
         }
     }
 
+    reject_unread_inputs(&active, &task_id).await;
     runtime.execution_manager.finish(&task_id, &active).await;
     runtime.task_changed.notify_waiters();
+}
+
+/// Closes the execution's live-input queue and tells the exchanges about each
+/// message the executor never read. Those messages were accepted, recorded and
+/// announced; the executor's turn ended without handling them, which the
+/// client that sent one is told by a `StreamError` naming it, rather than by
+/// silence.
+async fn reject_unread_inputs(active: &ActiveExecution, task_id: &str) {
+    if active.inputs.get().is_none() {
+        return;
+    }
+    // Under the writer: no message can be queued once the queue is closed.
+    let _writer = active.writer.lock().await;
+    reject_unread_inputs_locked(active, task_id).await;
+}
+
+/// [`reject_unread_inputs`] for a caller that already holds the task's writer.
+/// Called before a terminal event is published, so the errors come first: a
+/// stream ends on the terminal event and would never see them after it.
+async fn reject_unread_inputs_locked(active: &ActiveExecution, task_id: &str) {
+    let Some(queue) = active.inputs.get() else {
+        return;
+    };
+    for input in queue.close_and_drain() {
+        let event = StreamResponse::Error(StreamError {
+            task_id: task_id.to_string(),
+            code: "UNAVAILABLE".to_string(),
+            message: "the agent finished its turn before reading this message".to_string(),
+            reference_id: Some(input.message.message_id.clone()).filter(|id| !id.is_empty()),
+            metadata: None,
+        });
+        active
+            .publish_kind(Ok(&event), None, EventKind::LiveOnly)
+            .await;
+    }
+}
+
+/// Ends an execution with `error`: what the executor never read is answered
+/// first, then the error reaches the subscribers (which it ends).
+async fn fail_execution(active: &ActiveExecution, task_id: &str, error: &A2AError) {
+    let _writer = active.writer.lock().await;
+    reject_unread_inputs_locked(active, task_id).await;
+    active.publish(Err(error), None).await;
 }
 
 /// Publishes an error to the subscribers in order with the events around it:
@@ -1062,6 +1172,7 @@ async fn drive_execution_guarded(
         let _writer = active.writer.lock().await;
         if let Some(base) = active.snapshot().await {
             if !base.status.state.is_terminal() {
+                reject_unread_inputs_locked(&active, &task_id).await;
                 let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                     task_id: task_id.clone(),
                     context_id: base.context_id.clone(),
@@ -1084,6 +1195,7 @@ async fn drive_execution_guarded(
             }
         }
     }
+    reject_unread_inputs(&active, &task_id).await;
     if let Some(event) = failed_event {
         if let Err(error) = send_push_notifications(
             &task_id,
@@ -1482,7 +1594,7 @@ impl DefaultRequestHandler {
         &self,
         req: &SendMessageRequest,
         task_id: &str,
-    ) -> Result<(Task, bool, String), A2AError> {
+    ) -> Result<(Task, bool, String, Vec<StreamResponse>), A2AError> {
         let artifact_only = is_artifact_only(req);
         // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
         // and client-provided ids for *creating* tasks are not supported. Only
@@ -1541,6 +1653,7 @@ impl DefaultRequestHandler {
         };
 
         let existed = stored.is_some();
+        let mut events = Vec::new();
         let task = if let Some(mut existing) = stored {
             // A continuation turn's own incoming message was never otherwise
             // recorded anywhere: the executor only sees it via `ctx.message`
@@ -1554,7 +1667,7 @@ impl DefaultRequestHandler {
                     .get_or_insert_with(Vec::new)
                     .push(req.message.clone());
             }
-            record_client_input(&mut existing, req)?;
+            events = record_client_input(&mut existing, req)?;
             // Persisted now rather than with the executor's first event, so
             // the message and its generation are visible at once and survive
             // an executor that answers with a direct message or nothing.
@@ -1578,12 +1691,17 @@ impl DefaultRequestHandler {
                 history: Some(vec![req.message.clone()]),
                 metadata: None,
             };
-            apply_client_artifacts(&mut task, req, true)?;
+            events.push(client_message_event(&task, &req.message));
+            events.extend(
+                apply_client_artifacts(&mut task, req, true)?
+                    .into_iter()
+                    .map(StreamResponse::ArtifactUpdate),
+            );
             self.task_store.create(task.clone()).await?;
             task
         };
 
-        Ok((task, existed, context_id))
+        Ok((task, existed, context_id, events))
     }
 
     async fn save_request_push_config(
@@ -1923,7 +2041,14 @@ impl DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
         include_task_snapshot_in_context: bool,
-    ) -> Result<(Task, broadcast::Receiver<ExecutionEvent>), A2AError> {
+    ) -> Result<
+        (
+            Task,
+            broadcast::Receiver<ExecutionEvent>,
+            Vec<StreamResponse>,
+        ),
+        A2AError,
+    > {
         let artifact_only = is_artifact_only(&req);
         if !artifact_only {
             if req.message.message_id.is_empty() && !req.artifact_updates.is_empty() {
@@ -1953,7 +2078,7 @@ impl DefaultRequestHandler {
             task_id.clone(),
             Arc::clone(&active),
         );
-        let (task, existed, context_id) = {
+        let (task, existed, context_id, input_events) = {
             // The writer, held since the reservation until the snapshot below
             // is set, makes a cancel or a subscriber that finds this execution
             // wait for it instead of racing it.
@@ -1978,20 +2103,22 @@ impl DefaultRequestHandler {
             }
         };
         self.task_changed.notify_waiters();
+        // An executor that reads live input gets a queue for it, owned by the
+        // server so what the executor never reads is not lost. It is in place
+        // before the writer is let go, so no message is turned away for want of
+        // one.
+        let inputs = if self.executor.accepts_live_input() {
+            let queue = Arc::new(InputQueue::new(LIVE_INPUT_CAPACITY));
+            let _ = active.inputs.set(queue.clone());
+            Some(ClientInputs::from_queue(queue))
+        } else {
+            None
+        };
         // Subscribed before the writer is let go: nothing published after that
         // can be missed, a cancel that lands straight away included.
         let receiver = active.subscribe();
         drop(writer_guard);
 
-        // An executor that reads live input gets a channel for it; the sender
-        // stays with the execution so a live stream can reach it.
-        let inputs = if self.executor.accepts_live_input() {
-            let (sender, receiver) = tokio::sync::mpsc::channel(LIVE_INPUT_CAPACITY);
-            let _ = active.inputs.set(sender);
-            Some(receiver)
-        } else {
-            None
-        };
         let exec_ctx = crate::ExecutorContext {
             message: (!artifact_only).then_some(req.message),
             task_id: task_id.clone(),
@@ -2034,7 +2161,7 @@ impl DefaultRequestHandler {
             release.disarm();
         });
 
-        Ok((task, receiver))
+        Ok((task, receiver, input_events))
     }
 }
 
@@ -2085,11 +2212,11 @@ impl RequestHandler for DefaultRequestHandler {
             .configuration
             .as_ref()
             .and_then(|configuration| configuration.timeline_length);
-        let (task, receiver) = self.start_execution(params, req.clone(), true).await?;
+        let (task, receiver, _) = self.start_execution(params, req.clone(), true).await?;
         let task_id = task.id;
         // Unlike a client-facing stream this one keeps the executor's no-op
         // snapshots: the blocking send only needs to know the executor spoke.
-        let mut stream = subscription_stream(receiver, None, 0, true, false);
+        let mut stream = subscription_stream(receiver, None, 0, true, false, false);
         let mut last_event = None;
 
         while let Some(item) = stream.next().await {
@@ -2140,7 +2267,7 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.authorize(params, request_task_id(&req).as_deref())?;
         self.require_streaming()?;
-        let (task, receiver) = self.start_execution(params, req, false).await?;
+        let (task, receiver, _) = self.start_execution(params, req, false).await?;
         Ok(with_opening_task(
             subscription_stream(
                 receiver,
@@ -2148,6 +2275,7 @@ impl RequestHandler for DefaultRequestHandler {
                 0,
                 false,
                 is_at_least_1_1(&requested_protocol_version(params)),
+                false,
             ),
             task,
         ))
@@ -2244,6 +2372,11 @@ impl RequestHandler for DefaultRequestHandler {
             Err(error) => return Err(error),
         };
         if let Some(active) = &active_execution {
+            // The cancellation ends every stream of the task, and its event is
+            // published below: what the executor never read is answered before
+            // that. (Only now that the transition is certain: a cancel that
+            // failed leaves the task, and its input, as they were.)
+            reject_unread_inputs_locked(active, &req.id).await;
             // The executor must see the cancellation before it writes again.
             active.set_snapshot(task.clone()).await;
         }
@@ -2287,65 +2420,7 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        self.authorize(params, Some(&req.id))?;
-        self.require_streaming()?;
-        // An execution that is still being prepared has no snapshot to open
-        // with yet. Wait for the writer -- the request preparing it holds it --
-        // and look again, so the stream opens with the task, or, if the
-        // request failed and released the task, falls through to the checks
-        // below. The wait follows the lookup that found the execution, not one
-        // before it: a registration made in between is waited for too.
-        let mut resubscribed = self.execution_manager.resubscribe(&req.id).await;
-        if matches!(resubscribed, Some((_, None, _))) {
-            resubscribed = match self.execution_manager.get(&req.id).await {
-                Some(active) => {
-                    let _writer = active.writer.lock().await;
-                    // With the writer held a reservation that is still empty
-                    // belongs to a dropped request, so the task is not
-                    // executing; nothing is left to wait for.
-                    match active.snapshot().await {
-                        Some(_) => self.execution_manager.resubscribe(&req.id).await,
-                        None => None,
-                    }
-                }
-                None => None,
-            };
-        }
-        if let Some((receiver, snapshot_task, sequence)) = resubscribed {
-            // A client that already holds the task's current generation has
-            // missed nothing, so it resumes without a snapshot. One that is
-            // behind cannot be replayed to -- events are not retained -- and
-            // falls back to a snapshot, which the spec allows.
-            let snapshot_task = match (req.last_seen_generation, snapshot_task) {
-                (Some(last_seen), Some(task))
-                    if task.generation == last_seen && !task.status.state.is_terminal() =>
-                {
-                    None
-                }
-                (_, snapshot) => snapshot,
-            };
-            return Ok(subscription_stream(
-                receiver,
-                snapshot_task,
-                sequence,
-                false,
-                is_at_least_1_1(&requested_protocol_version(params)),
-            ));
-        }
-
-        // A registry miss also happens once a task finishes and its
-        // execution is cleaned up, so it doesn't by itself mean the task
-        // never existed -- check the store to tell the two apart before
-        // reporting TaskNotFoundError.
-        if let Some(task) = self.task_store.get(&req.id).await? {
-            if task.status.state.is_terminal() {
-                return Err(A2AError::unsupported_operation(format!(
-                    "task {} has already reached a terminal state",
-                    req.id
-                )));
-            }
-        }
-        Err(A2AError::task_not_found(&req.id))
+        self.subscribe_stream(params, req, false).await
     }
 
     async fn send_live_message(
@@ -2354,9 +2429,14 @@ impl RequestHandler for DefaultRequestHandler {
         uplink: BoxStream<'static, StreamRequest>,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let uplink = uplink
-            .map(|request| LiveItem { request, ack: None })
+            .map(|request| LiveItem {
+                request,
+                params: None,
+                ack: None,
+            })
             .boxed();
-        self.open_live(params, uplink, None).await
+        self.open_live(params, live::Uplink::Stream(uplink), None)
+            .await
     }
 
     async fn send_live_request(
@@ -5626,11 +5706,11 @@ mod lag_coverage_tests {
                     extensions: None,
                     reference_task_ids: None,
                 })),
-                repeated: false,
+                kind: EventKind::Normal,
             });
         }
 
-        let mut stream = subscription_stream(receiver, None, 0, true, false);
+        let mut stream = subscription_stream(receiver, None, 0, true, false, false);
         let item = stream.next().await.expect("lagged item");
 
         let error = item.expect_err("lag must surface as an error");

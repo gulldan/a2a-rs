@@ -376,12 +376,12 @@ struct GrpcLiveUplink {
 
 #[async_trait]
 impl a2a_client::LiveUplink for GrpcLiveUplink {
-    async fn send(&self, request: StreamRequest) -> Result<Option<Task>, A2AError> {
+    async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
         self.sender
             .send(pbconv::to_proto_stream_request(&request))
             .await
             .map_err(|_| A2AError::invalid_request("the live exchange is no longer open"))?;
-        Ok(None)
+        Ok(a2a_client::LiveAck::Sent)
     }
 }
 

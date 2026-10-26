@@ -12,47 +12,120 @@
 //! nothing left to say closes it.
 
 use super::*;
+use crate::executor::{ClientInput, InputRefusal};
+use futures::FutureExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// What a live session's uplink carries: a request, and, for an HTTP uplink
-/// call that is waiting for its acknowledgement, where to send the task state.
+/// call that is waiting for its acknowledgement, where to send the answer.
 pub(crate) struct LiveItem {
     pub(crate) request: StreamRequest,
-    pub(crate) ack: Option<oneshot::Sender<Task>>,
+    /// Who made this call, when it is not who opened the exchange (a later
+    /// HTTP call has its own credentials and version).
+    pub(crate) params: Option<ServiceParams>,
+    /// `Some(task)`: the request was handled, here is the task. `None`: the
+    /// exchange ended before it got to this request, so nothing was done.
+    /// A dropped sender: it was handled but the task could not be read back.
+    pub(crate) ack: Option<AckGuard>,
+}
+
+/// The answer to an HTTP uplink call, which says "not reached" if the item is
+/// dropped without being handled: when the session ends, panics, or never gets
+/// to the call. The session takes the sender out (`into_sender`) when it starts
+/// handling the call, after which a drop means "handled, outcome unknown".
+pub(crate) struct AckGuard(Option<oneshot::Sender<Option<Task>>>);
+
+impl AckGuard {
+    pub(crate) fn new(sender: oneshot::Sender<Option<Task>>) -> Self {
+        AckGuard(Some(sender))
+    }
+
+    fn into_sender(mut self) -> oneshot::Sender<Option<Task>> {
+        self.0.take().expect("an ack guard holds its sender")
+    }
+}
+
+impl Drop for AckGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(None);
+        }
+    }
+}
+
+/// The client's side of an exchange as the session reads it.
+pub(crate) enum Uplink {
+    /// Calls arriving one at a time over HTTP, through a channel the session
+    /// can close.
+    Http(mpsc::Receiver<LiveItem>),
+    /// A stream of requests (gRPC, SLIMRPC).
+    Stream(BoxStream<'static, LiveItem>),
+}
+
+impl Uplink {
+    async fn next(&mut self) -> Option<LiveItem> {
+        match self {
+            Uplink::Http(receiver) => receiver.recv().await,
+            Uplink::Stream(stream) => stream.next().await,
+        }
+    }
+
+    /// Refuses any further call and answers the ones queued but never reached,
+    /// so a caller that got its call in just as the exchange ended is told it
+    /// was not carried out (and may open a new exchange with it) instead of
+    /// waiting for an answer that will not come.
+    async fn close(&mut self) {
+        match self {
+            Uplink::Http(receiver) => {
+                // After `close` nothing more can be sent, and what was sent
+                // before it is still received here.
+                receiver.close();
+                // Dropping an item answers its caller "not reached".
+                while receiver.recv().await.is_some() {}
+            }
+            Uplink::Stream(stream) => while let Some(Some(_)) = stream.next().now_or_never() {},
+        }
+    }
 }
 
 /// The open live sessions, by task, so a short-lived HTTP call can be routed to
 /// the session whose downlink is already open.
 #[derive(Default)]
 pub(crate) struct LiveSessions {
-    open: std::sync::Mutex<HashMap<TaskId, mpsc::Sender<LiveItem>>>,
+    open: std::sync::Mutex<HashMap<TaskId, Vec<mpsc::Sender<LiveItem>>>>,
 }
 
 impl LiveSessions {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<TaskId, mpsc::Sender<LiveItem>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<TaskId, Vec<mpsc::Sender<LiveItem>>>> {
         self.open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn register(&self, task_id: &str, sender: mpsc::Sender<LiveItem>) {
-        self.lock().insert(task_id.to_string(), sender);
+        self.lock()
+            .entry(task_id.to_string())
+            .or_default()
+            .push(sender);
     }
 
+    /// The newest session still open for the task.
     fn route(&self, task_id: &str) -> Option<mpsc::Sender<LiveItem>> {
         self.lock()
-            .get(task_id)
-            .filter(|sender| !sender.is_closed())
+            .get(task_id)?
+            .iter()
+            .rev()
+            .find(|sender| !sender.is_closed())
             .cloned()
     }
 
     fn unregister(&self, task_id: &str, sender: &mpsc::Sender<LiveItem>) {
         let mut open = self.lock();
-        if open
-            .get(task_id)
-            .is_some_and(|current| current.same_channel(sender))
-        {
-            open.remove(task_id);
+        if let Some(senders) = open.get_mut(task_id) {
+            senders.retain(|current| !current.same_channel(sender) && !current.is_closed());
+            if senders.is_empty() {
+                open.remove(task_id);
+            }
         }
     }
 }
@@ -60,6 +133,7 @@ impl LiveSessions {
 /// The answer to one `SendLiveMessage` call over a transport that has no
 /// native duplex (A2A 1.1 §3.1.12): the call that opens the exchange is the
 /// downlink, and a later call for the same task only gets the task state back.
+#[non_exhaustive]
 pub enum LiveResponse {
     /// This call is the downlink: the events, until the exchange ends.
     Stream(BoxStream<'static, Result<StreamResponse, A2AError>>),
@@ -125,8 +199,11 @@ enum Delivery {
     Started {
         task: Task,
         receiver: broadcast::Receiver<ExecutionEvent>,
-        /// The generation of the timeline entry it became (0 if none).
-        message_generation: i64,
+        /// What the request recorded before the turn began, as events: the
+        /// message as it was appended, then each artifact. A stream that
+        /// already holds the task is told them; the first request's opening
+        /// snapshot already reflects them.
+        recorded: Vec<StreamResponse>,
     },
     /// The message went into the execution that was running.
     Injected {
@@ -146,13 +223,44 @@ fn is_in_progress(error: &A2AError) -> bool {
     error.code == error_code::INVALID_REQUEST && error.message.contains("already in progress")
 }
 
-fn last_message_generation(task: &Task) -> i64 {
-    task.timeline
-        .iter()
-        .flatten()
-        .rev()
-        .find(|entry| matches!(entry.content, TimelineContent::Message(_)))
-        .map_or(0, |entry| entry.generation)
+/// The generation an event reports, if it reports one.
+fn generation_of(event: &StreamResponse) -> Option<i64> {
+    match event {
+        StreamResponse::Task(task) => Some(task.generation),
+        StreamResponse::StatusUpdate(update) => Some(update.generation),
+        StreamResponse::ArtifactUpdate(update) => Some(update.generation),
+        StreamResponse::MessageUpdate(update) => Some(update.generation),
+        _ => None,
+    }
+}
+
+/// How soon an idle session looks at its task again, and how far it backs off
+/// while nothing changes. (A server-wide wake-up for every change anywhere
+/// would have every idle session reading the store each time.)
+const IDLE_RECHECK: Duration = Duration::from_millis(250);
+const IDLE_RECHECK_MAX: Duration = Duration::from_secs(1);
+
+/// What looking at an idle task found.
+enum Reattach {
+    /// The exchange is over (the task ended, or is gone).
+    End,
+    /// The exchange follows a running execution now, or was told of a change.
+    Changed,
+    Unchanged,
+}
+
+/// Whether `task` holds the message `request` carries (always true for a
+/// request that has no message id to look for).
+fn records_message(task: &Task, request: &StreamRequest) -> bool {
+    let StreamRequestPayload::SendMessage(send) = &request.payload else {
+        return true;
+    };
+    let id = &send.message.message_id;
+    id.is_empty()
+        || task.history.iter().flatten().any(|m| &m.message_id == id)
+        || task.timeline.iter().flatten().any(
+            |entry| matches!(&entry.content, TimelineContent::Message(m) if &m.message_id == id),
+        )
 }
 
 impl DefaultRequestHandler {
@@ -171,23 +279,51 @@ impl DefaultRequestHandler {
                     let (ack, acknowledged) = oneshot::channel();
                     let item = LiveItem {
                         request: request.clone(),
-                        ack: Some(ack),
+                        params: Some(params.clone()),
+                        ack: Some(AckGuard::new(ack)),
                     };
-                    if session.send(item).await.is_ok() {
-                        if let Ok(task) = acknowledged.await {
-                            return Ok(LiveResponse::Ack(Box::new(task)));
+                    let sent = session.send(item).await.is_ok();
+                    // Not held while waiting: the session's channel must be
+                    // free to close when the exchange ends.
+                    drop(session);
+                    if sent {
+                        match acknowledged.await {
+                            Ok(Some(task)) => return Ok(LiveResponse::Ack(Box::new(task))),
+                            // Handled, but the task could not be read back
+                            // then: it is read now, and the request is not
+                            // delivered a second time.
+                            // Unless the exchange was lost midway, and the
+                            // message is not in the task: then nothing says it
+                            // was carried out, and the caller is told so.
+                            Err(_) => {
+                                let task = self.load_task(&task_id).await?;
+                                if !records_message(&task, &request) {
+                                    return Err(A2AError::internal(
+                                        "the live exchange failed while handling the request",
+                                    ));
+                                }
+                                return Ok(LiveResponse::Ack(Box::new(task)));
+                            }
+                            // The exchange ended before it got to this call,
+                            // which opens a new one below.
+                            Ok(None) => {}
                         }
                     }
-                    // The exchange ended while the call was on its way: this
-                    // call opens a new one.
                 }
             }
         }
 
         let (sender, receiver) = mpsc::channel(LIVE_UPLINK_CAPACITY);
-        let _ = sender.send(LiveItem { request, ack: None }).await;
-        let uplink = ReceiverStream::new(receiver).boxed();
-        let downlink = self.open_live(params, uplink, Some(sender)).await?;
+        let _ = sender
+            .send(LiveItem {
+                request,
+                params: None,
+                ack: None,
+            })
+            .await;
+        let downlink = self
+            .open_live(params, Uplink::Http(receiver), Some(sender))
+            .await?;
         Ok(LiveResponse::Stream(downlink))
     }
 
@@ -196,7 +332,7 @@ impl DefaultRequestHandler {
     pub(super) async fn open_live(
         &self,
         params: &ServiceParams,
-        mut uplink: BoxStream<'static, LiveItem>,
+        mut uplink: Uplink,
         registration: Option<mpsc::Sender<LiveItem>>,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.require_streaming()?;
@@ -206,6 +342,8 @@ impl DefaultRequestHandler {
             .await
             .ok_or_else(|| A2AError::invalid_request("a live stream needs a first request"))?;
 
+        // The generation the client has already been told of, when it said so.
+        let mut seen_generation = 0;
         let (task_id, opening, inner) = match first.request.payload {
             StreamRequestPayload::SendMessage(request) => {
                 self.authorize(params, request_task_id(&request).as_deref())?;
@@ -215,8 +353,14 @@ impl DefaultRequestHandler {
                     .map_err(Rejection::into_error)?
                 {
                     Delivery::Started { task, receiver, .. } => {
-                        let events =
-                            subscription_stream(receiver, None, 0, false, wants_message_updates);
+                        let events = subscription_stream(
+                            receiver,
+                            None,
+                            0,
+                            false,
+                            wants_message_updates,
+                            true,
+                        );
                         (task.id.clone(), Some(task), Some(events))
                     }
                     Delivery::Injected {
@@ -233,6 +377,7 @@ impl DefaultRequestHandler {
                             sequence_after,
                             false,
                             wants_message_updates,
+                            true,
                         );
                         (task.id.clone(), Some(task), Some(events))
                     }
@@ -241,14 +386,18 @@ impl DefaultRequestHandler {
             StreamRequestPayload::Subscribe(subscribe) => {
                 self.authorize(params, Some(&subscribe.id))?;
                 let task_id = subscribe.id.clone();
-                match self.subscribe_to_task(params, subscribe).await {
+                let last_seen = subscribe.last_seen_generation;
+                seen_generation = last_seen.unwrap_or(0);
+                match self.subscribe_stream(params, subscribe, true).await {
                     Ok(events) => (task_id, None, Some(events)),
                     // An idle task that is not finished is still there to be
-                    // observed: the exchange opens with it and waits.
+                    // observed: the exchange opens with it (unless the client
+                    // already holds this generation) and waits.
                     Err(error) if error.code == error_code::TASK_NOT_FOUND => {
                         match self.task_store.get(&task_id).await? {
                             Some(task) if !task.status.state.is_terminal() => {
-                                (task_id, Some(task), None)
+                                let current = last_seen == Some(task.generation);
+                                (task_id, (!current).then_some(task), None)
                             }
                             _ => return Err(error),
                         }
@@ -274,7 +423,7 @@ impl DefaultRequestHandler {
             wants_message_updates,
             registration,
         };
-        tokio::spawn(session.run(opening, inner, uplink, out));
+        tokio::spawn(session.run(opening, inner, seen_generation, uplink, out));
         Ok(ReceiverStream::new(downlink).boxed())
     }
 
@@ -290,37 +439,39 @@ impl DefaultRequestHandler {
             self.validate_content_types(&request.message)?;
         }
         let task_id = request_task_id(&request);
-        if let Some(task_id) = &task_id {
-            if let Some(delivery) = self.try_inject(&request, task_id).await? {
-                return Ok(delivery);
+        let mut last_error = None;
+        // Another request may start the task between the look and the start, and
+        // finish before the message can join it: each lap looks again.
+        for _ in 0..3 {
+            if let Some(task_id) = &task_id {
+                if let Some(delivery) = self.try_inject(params, &request, task_id).await? {
+                    return Ok(delivery);
+                }
+            }
+            match self.start_execution(params, request.clone(), false).await {
+                Ok((task, receiver, recorded)) => {
+                    return Ok(Delivery::Started {
+                        task,
+                        receiver,
+                        recorded,
+                    });
+                }
+                Err(error) if is_in_progress(&error) && task_id.is_some() => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(Rejection::Failed(error)),
             }
         }
-        match self.start_execution(params, request.clone(), false).await {
-            Ok((task, receiver)) => {
-                let message_generation = last_message_generation(&task);
-                Ok(Delivery::Started {
-                    task,
-                    receiver,
-                    message_generation,
-                })
-            }
-            // Another request started the task between the look and the start:
-            // the message belongs to that execution now.
-            Err(error) if is_in_progress(&error) => match &task_id {
-                Some(task_id) => match self.try_inject(&request, task_id).await? {
-                    Some(delivery) => Ok(delivery),
-                    None => Err(Rejection::Failed(error)),
-                },
-                None => Err(Rejection::Failed(error)),
-            },
-            Err(error) => Err(Rejection::Failed(error)),
-        }
+        Err(Rejection::Failed(last_error.unwrap_or_else(|| {
+            A2AError::internal("could not deliver the message")
+        })))
     }
 
     /// Appends the message to the task under the writer lock and passes it to
     /// the running executor. `None` when no execution is running.
     async fn try_inject(
         &self,
+        params: &ServiceParams,
         request: &SendMessageRequest,
         task_id: &str,
     ) -> Result<Option<Delivery>, Rejection> {
@@ -368,6 +519,14 @@ impl DefaultRequestHandler {
         }
 
         let artifact_only = is_artifact_only(request);
+        if !artifact_only
+            && request.message.message_id.is_empty()
+            && !request.artifact_updates.is_empty()
+        {
+            return Err(Rejection::Failed(A2AError::invalid_params(
+                "a message sent with artifactUpdates must have a messageId",
+            )));
+        }
         // Room for the message is secured before anything is changed, so a
         // message the executor cannot take is declined with nothing recorded.
         let permit = if artifact_only {
@@ -376,15 +535,20 @@ impl DefaultRequestHandler {
             let inputs = active.inputs.get().ok_or_else(|| {
                 Rejection::Declined("the agent does not take input while it works".to_string())
             })?;
-            Some(inputs.try_reserve().map_err(|error| match error {
-                mpsc::error::TrySendError::Full(()) => {
+            Some(inputs.try_reserve().map_err(|refusal| match refusal {
+                InputRefusal::Full => {
                     Rejection::Declined("the agent is busy with earlier input".to_string())
                 }
-                mpsc::error::TrySendError::Closed(()) => {
+                InputRefusal::Closed => {
                     Rejection::Declined("the agent is no longer taking input".to_string())
                 }
             })?)
         };
+
+        // A push configuration sent with the message is registered like any
+        // other (A2A 1.1 §3.1.12), once the message is certain to be taken.
+        self.save_request_push_config(params, task_id, request)
+            .await?;
 
         let mut task = base;
         let mut events = Vec::new();
@@ -455,9 +619,83 @@ impl DefaultRequestHandler {
     }
 }
 
+impl DefaultRequestHandler {
+    /// `SubscribeToTask`, for an ordinary stream or (`live`) for the downlink of
+    /// a live exchange, which is also told what only a live exchange is.
+    pub(super) async fn subscribe_stream(
+        &self,
+        params: &ServiceParams,
+        req: SubscribeToTaskRequest,
+        live: bool,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.authorize(params, Some(&req.id))?;
+        self.require_streaming()?;
+        // An execution that is still being prepared has no snapshot to open
+        // with yet. Wait for the writer -- the request preparing it holds it --
+        // and look again, so the stream opens with the task, or, if the
+        // request failed and released the task, falls through to the checks
+        // below. The wait follows the lookup that found the execution, not one
+        // before it: a registration made in between is waited for too.
+        let mut resubscribed = self.execution_manager.resubscribe(&req.id).await;
+        if matches!(resubscribed, Some((_, None, _))) {
+            resubscribed = match self.execution_manager.get(&req.id).await {
+                Some(active) => {
+                    let _writer = active.writer.lock().await;
+                    // With the writer held a reservation that is still empty
+                    // belongs to a dropped request, so the task is not
+                    // executing; nothing is left to wait for.
+                    match active.snapshot().await {
+                        Some(_) => self.execution_manager.resubscribe(&req.id).await,
+                        None => None,
+                    }
+                }
+                None => None,
+            };
+        }
+        if let Some((receiver, snapshot_task, sequence)) = resubscribed {
+            // A client that already holds the task's current generation has
+            // missed nothing, so it resumes without a snapshot. One that is
+            // behind cannot be replayed to -- events are not retained -- and
+            // falls back to a snapshot, which the spec allows.
+            let snapshot_task = match (req.last_seen_generation, snapshot_task) {
+                (Some(last_seen), Some(task))
+                    if task.generation == last_seen && !task.status.state.is_terminal() =>
+                {
+                    None
+                }
+                (_, snapshot) => snapshot,
+            };
+            return Ok(subscription_stream(
+                receiver,
+                snapshot_task,
+                sequence,
+                false,
+                is_at_least_1_1(&requested_protocol_version(params)),
+                live,
+            ));
+        }
+
+        // A registry miss also happens once a task finishes and its
+        // execution is cleaned up, so it doesn't by itself mean the task
+        // never existed -- check the store to tell the two apart before
+        // reporting TaskNotFoundError.
+        if let Some(task) = self.task_store.get(&req.id).await? {
+            if task.status.state.is_terminal() {
+                return Err(A2AError::unsupported_operation(format!(
+                    "task {} has already reached a terminal state",
+                    req.id
+                )));
+            }
+        }
+        Err(A2AError::task_not_found(&req.id))
+    }
+}
+
 /// One running exchange: the loop that owns the downlink.
 struct LiveRun {
     handler: DefaultRequestHandler,
+    /// Who opened the exchange; a request that carries its own are served as
+    /// that caller.
     params: ServiceParams,
     /// The task the exchange is bound to, for its whole life.
     task_id: TaskId,
@@ -465,20 +703,29 @@ struct LiveRun {
     registration: Option<mpsc::Sender<LiveItem>>,
 }
 
+type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
+type Downlink = mpsc::Sender<Result<StreamResponse, A2AError>>;
+
 impl LiveRun {
     async fn run(
         self,
         opening: Option<Task>,
-        mut inner: Option<BoxStream<'static, Result<StreamResponse, A2AError>>>,
-        mut uplink: BoxStream<'static, LiveItem>,
-        out: mpsc::Sender<Result<StreamResponse, A2AError>>,
+        mut inner: Option<Events>,
+        seen_generation: i64,
+        mut uplink: Uplink,
+        out: Downlink,
     ) {
+        // The generation the client has been told of, so a change it was not
+        // there for (an idle task, then another client's turn) is noticed.
+        let mut last_generation = seen_generation;
         if let Some(task) = opening {
+            last_generation = task.generation;
             if out.send(Ok(StreamResponse::Task(task))).await.is_err() {
-                return self.finish();
+                return self.finish(uplink).await;
             }
         }
         let mut uplink_open = true;
+        let mut idle_wait = IDLE_RECHECK;
         loop {
             tokio::select! {
                 // The client went away: nothing is left to deliver to.
@@ -494,6 +741,9 @@ impl LiveRun {
                             Ok(event) => is_terminal_event(event),
                             Err(_) => true,
                         };
+                        if let Some(generation) = item.as_ref().ok().and_then(generation_of) {
+                            last_generation = last_generation.max(generation);
+                        }
                         if out.send(item).await.is_err() || ends {
                             break;
                         }
@@ -507,9 +757,22 @@ impl LiveRun {
                         }
                     }
                 },
+                // Nothing is running that this exchange follows: it watches the
+                // task, so another client's turn, or a cancel, reaches it too.
+                () = tokio::time::sleep(idle_wait), if inner.is_none() => {
+                    match self.reattach(&mut inner, &mut last_generation, &out).await {
+                        Reattach::End => break,
+                        // Something happened: look again soon.
+                        Reattach::Changed => idle_wait = IDLE_RECHECK,
+                        // Nothing did: look a little less often, up to a limit.
+                        Reattach::Unchanged => {
+                            idle_wait = (idle_wait * 2).min(IDLE_RECHECK_MAX);
+                        }
+                    }
+                },
                 item = uplink.next(), if uplink_open => match item {
                     Some(item) => {
-                        if !self.handle(item, &mut inner, &out).await {
+                        if !self.handle(item, &mut inner, &mut last_generation, &out).await {
                             break;
                         }
                     }
@@ -522,12 +785,63 @@ impl LiveRun {
                 },
             }
         }
-        self.finish();
+        self.finish(uplink).await;
     }
 
-    fn finish(&self) {
+    /// Ends the exchange: no more calls are routed to it, and a call that was
+    /// queued but never reached is told so (it is delivered nowhere, so the
+    /// caller may open a new exchange with it).
+    async fn finish(&self, mut uplink: Uplink) {
         if let Some(registration) = &self.registration {
             self.handler.live.unregister(&self.task_id, registration);
+        }
+        uplink.close().await;
+    }
+
+    /// Looks at the task while the exchange follows no execution. Follows a new
+    /// one if it has started, tells the client of changes it was not there for
+    /// (and that the task has ended). `false` when the exchange is over.
+    async fn reattach(
+        &self,
+        inner: &mut Option<Events>,
+        last_generation: &mut i64,
+        out: &Downlink,
+    ) -> Reattach {
+        if let Some((receiver, Some(snapshot), sequence)) = self
+            .handler
+            .execution_manager
+            .resubscribe(&self.task_id)
+            .await
+        {
+            // Events carry on from the snapshot, which tells where things stand.
+            *last_generation = (*last_generation).max(snapshot.generation);
+            *inner = Some(subscription_stream(
+                receiver,
+                Some(snapshot),
+                sequence,
+                false,
+                self.wants_message_updates,
+                true,
+            ));
+            return Reattach::Changed;
+        }
+        let Ok(task) = self.handler.load_task(&self.task_id).await else {
+            return Reattach::End;
+        };
+        let ended = task.status.state.is_terminal();
+        let changed = task.generation > *last_generation;
+        if ended || changed {
+            *last_generation = task.generation;
+            if out.send(Ok(StreamResponse::Task(task))).await.is_err() {
+                return Reattach::End;
+            }
+        }
+        if ended {
+            Reattach::End
+        } else if changed {
+            Reattach::Changed
+        } else {
+            Reattach::Unchanged
         }
     }
 
@@ -536,16 +850,35 @@ impl LiveRun {
     async fn handle(
         &self,
         item: LiveItem,
-        inner: &mut Option<BoxStream<'static, Result<StreamResponse, A2AError>>>,
-        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
+        inner: &mut Option<Events>,
+        last_generation: &mut i64,
+        out: &Downlink,
     ) -> bool {
-        let LiveItem { request, ack } = item;
+        let LiveItem {
+            request,
+            params,
+            ack,
+        } = item;
+        // From here the call is being handled: if this task is lost midway, its
+        // caller is told the outcome is unknown, not that nothing was done.
+        let ack = ack.map(AckGuard::into_sender);
+        let params = params.unwrap_or_else(|| self.params.clone());
         let mut reference_id = None;
         let result: Result<(), Rejection> = match request.payload {
             StreamRequestPayload::SendMessage(mut request) => {
-                reference_id = Some(request.message.message_id.clone()).filter(|id| !id.is_empty());
+                reference_id = Some(request.message.message_id.clone())
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| {
+                        request
+                            .artifact_updates
+                            .first()
+                            .map(|update| update.artifact.artifact_id.clone())
+                    });
                 match self.bind(&mut request) {
-                    Ok(()) => self.deliver(request, inner, out).await,
+                    Ok(()) => {
+                        self.deliver(&params, request, inner, last_generation, out)
+                            .await
+                    }
                     Err(rejection) => Err(rejection),
                 }
             }
@@ -559,15 +892,52 @@ impl LiveRun {
                 "unrecognised StreamRequest payload",
             ))),
         };
+        let mut downlink_open = true;
         if let Err(rejection) = result {
-            let event = rejection.into_stream_error(&self.task_id, reference_id);
-            if out.send(Ok(event)).await.is_err() {
-                return false;
+            // Ordering is by arrival: what the exchange has already published
+            // for earlier requests goes out before this one's rejection.
+            downlink_open = self.flush(inner, last_generation, out).await;
+            if downlink_open {
+                let event = rejection.into_stream_error(&self.task_id, reference_id);
+                downlink_open = out.send(Ok(event)).await.is_ok();
             }
         }
         if let Some(ack) = ack {
+            // Answered whatever became of the downlink: the call was handled.
+            // Dropped, not answered, only when the task cannot be read back;
+            // the caller then reads it itself and does not send it again.
             if let Ok(task) = self.handler.load_task(&self.task_id).await {
-                let _ = ack.send(task);
+                let _ = ack.send(Some(task));
+            }
+        }
+        downlink_open
+    }
+
+    /// Forwards what the execution being followed has published already,
+    /// without waiting for more. `false` when the downlink is gone or the
+    /// exchange ended with a terminal event.
+    async fn flush(
+        &self,
+        inner: &mut Option<Events>,
+        last_generation: &mut i64,
+        out: &Downlink,
+    ) -> bool {
+        while let Some(events) = inner.as_mut() {
+            match events.next().now_or_never() {
+                Some(Some(item)) => {
+                    let ends = match &item {
+                        Ok(event) => is_terminal_event(event),
+                        Err(_) => true,
+                    };
+                    if let Some(generation) = item.as_ref().ok().and_then(generation_of) {
+                        *last_generation = (*last_generation).max(generation);
+                    }
+                    if out.send(item).await.is_err() || ends {
+                        return false;
+                    }
+                }
+                Some(None) => *inner = None,
+                None => break,
             }
         }
         true
@@ -593,18 +963,18 @@ impl LiveRun {
 
     async fn deliver(
         &self,
+        params: &ServiceParams,
         request: SendMessageRequest,
-        inner: &mut Option<BoxStream<'static, Result<StreamResponse, A2AError>>>,
-        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
+        inner: &mut Option<Events>,
+        last_generation: &mut i64,
+        out: &Downlink,
     ) -> Result<(), Rejection> {
         self.handler
-            .authorize(&self.params, Some(&self.task_id))
+            .authorize(params, Some(&self.task_id))
             .map_err(Rejection::Failed)?;
-        match self.handler.live_deliver(&self.params, request).await? {
+        match self.handler.live_deliver(params, request).await? {
             Delivery::Started {
-                receiver,
-                message_generation,
-                task,
+                receiver, recorded, ..
             } => {
                 *inner = Some(subscription_stream(
                     receiver,
@@ -612,28 +982,22 @@ impl LiveRun {
                     0,
                     false,
                     self.wants_message_updates,
+                    true,
                 ));
-                // The message started a turn nobody was running: the stream
-                // is told it was appended, as it is for one that joins a
-                // running turn.
-                if self.wants_message_updates && message_generation > 0 {
-                    let message =
-                        task.timeline.iter().flatten().rev().find_map(|entry| {
-                            match &entry.content {
-                                TimelineContent::Message(message) => Some(message.clone()),
-                                _ => None,
-                            }
-                        });
-                    if let Some(message) = message {
-                        let _ = out
-                            .send(Ok(StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
-                                task_id: task.id.clone(),
-                                context_id: task.context_id.clone(),
-                                message,
-                                metadata: None,
-                                generation: message_generation,
-                            })))
-                            .await;
+                // The request recorded its message (and artifacts) before the
+                // turn began, with nothing subscribed to hear it: this stream
+                // is told, as it would be for a turn already running. An
+                // artifact-only request has no message to announce.
+                for event in recorded {
+                    let announces_message = matches!(event, StreamResponse::MessageUpdate(_));
+                    if announces_message && !self.wants_message_updates {
+                        continue;
+                    }
+                    if let Some(generation) = generation_of(&event) {
+                        *last_generation = (*last_generation).max(generation);
+                    }
+                    if out.send(Ok(event)).await.is_err() {
+                        break;
                     }
                 }
             }
@@ -652,6 +1016,7 @@ impl LiveRun {
                         sequence_before,
                         false,
                         self.wants_message_updates,
+                        true,
                     ));
                 }
             }
