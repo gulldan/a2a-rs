@@ -215,8 +215,9 @@ pub struct AuthenticationInfo {
 /// This allows agents to expose the same functionality over multiple protocol binding mechanisms.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AgentInterface {
-    /// The URL where this interface is available. Must be a valid absolute HTTPS URL in production.
-    /// Example: "<https://api.example.com/a2a/v1",> "<https://grpc.example.com/a2a">
+    /// The URL or address where this interface is available. For HTTP-based transports, must be a valid absolute
+    /// HTTPS URL in production. For gRPC, the address should be in the format "hostname:port".
+    /// Example: "<https://api.example.com/a2a/v1",> "grpc.example.com:443"
     #[prost(string, tag = "1")]
     pub url: ::prost::alloc::string::String,
     /// The protocol binding supported at this URL. This is an open form string, to be
@@ -224,7 +225,12 @@ pub struct AgentInterface {
     /// supported are `JSONRPC`, `GRPC` and `HTTP+JSON`.
     #[prost(string, tag = "2")]
     pub protocol_binding: ::prost::alloc::string::String,
-    /// Tenant ID to be used in the request when calling the agent.
+    /// Optional. An opaque string used for routing requests to a specific agent
+    /// or tenant when multiple agents are served behind a single A2A endpoint.
+    /// When set, clients MUST include this value in the `tenant` field of all
+    /// request messages sent to this interface. The server is responsible for
+    /// interpreting the value and routing requests accordingly; the protocol
+    /// does not define its format or semantics.
     #[prost(string, tag = "3")]
     pub tenant: ::prost::alloc::string::String,
     /// The version of the A2A protocol this interface exposes.
@@ -385,7 +391,8 @@ pub struct AgentCardSignature {
 /// A container associating a push notification configuration with a specific task.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TaskPushNotificationConfig {
-    /// Optional. Tenant ID.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
     /// The push notification configuration details.
@@ -639,7 +646,8 @@ pub struct DeviceCodeOAuthFlow {
 /// Represents a request for the `SendMessage` method.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SendMessageRequest {
-    /// Optional. Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
     /// The message to send to the agent.
@@ -655,7 +663,8 @@ pub struct SendMessageRequest {
 /// Represents a request for the `GetTask` method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetTaskRequest {
-    /// Optional. Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
     /// The resource ID of the task to retrieve.
@@ -671,7 +680,8 @@ pub struct GetTaskRequest {
 /// Parameters for listing tasks with optional filtering criteria.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListTasksRequest {
-    /// Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
     /// Filter tasks by context ID to get tasks from a specific conversation or session.
@@ -722,7 +732,8 @@ pub struct ListTasksResponse {
 /// Represents a request for the `CancelTask` method.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CancelTaskRequest {
-    /// Optional. Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
     /// The resource ID of the task to cancel.
@@ -735,7 +746,8 @@ pub struct CancelTaskRequest {
 /// Represents a request for the `GetTaskPushNotificationConfig` method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetTaskPushNotificationConfigRequest {
-    /// Optional. Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
     /// The parent task resource ID.
@@ -748,7 +760,8 @@ pub struct GetTaskPushNotificationConfigRequest {
 /// Represents a request for the `DeleteTaskPushNotificationConfig` method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteTaskPushNotificationConfigRequest {
-    /// Optional. Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
     /// The parent task resource ID.
@@ -761,7 +774,8 @@ pub struct DeleteTaskPushNotificationConfigRequest {
 /// Represents a request for the `SubscribeToTask` method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubscribeToTaskRequest {
-    /// Optional. Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
     /// The resource ID of the task to subscribe to.
@@ -771,7 +785,8 @@ pub struct SubscribeToTaskRequest {
 /// Represents a request for the `ListTaskPushNotificationConfigs` method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListTaskPushNotificationConfigsRequest {
-    /// Optional. Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "4")]
     pub tenant: ::prost::alloc::string::String,
     /// The parent task resource ID.
@@ -787,7 +802,8 @@ pub struct ListTaskPushNotificationConfigsRequest {
 /// Represents a request for the `GetExtendedAgentCard` method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetExtendedAgentCardRequest {
-    /// Optional. Tenant ID, provided as a path parameter.
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
 }
