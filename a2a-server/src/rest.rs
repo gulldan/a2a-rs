@@ -17,13 +17,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::handler::RequestHandler;
+use crate::handler::{LiveResponse, RequestHandler};
 use crate::middleware::{ServiceParams, extract_service_params};
 use crate::sse;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_SEND_MESSAGE_LEGACY_PATH: &str = "/message/send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
+const REST_LIVE_MESSAGE_PATH: &str = "/message:live";
 const REST_STREAM_MESSAGE_LEGACY_PATH: &str = "/message/stream";
 const REST_EXTENDED_AGENT_CARD_PATH: &str = "/extendedAgentCard";
 const REST_EXTENDED_AGENT_CARD_LEGACY_PATH: &str = "/agent-card/extended";
@@ -76,6 +77,10 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
         .route(
             REST_STREAM_MESSAGE_LEGACY_PATH,
             axum::routing::post(handle_stream_message::<H>),
+        )
+        .route(
+            REST_LIVE_MESSAGE_PATH,
+            axum::routing::post(handle_live_message::<H>),
         )
         .route(
             "/tasks/{id}",
@@ -150,6 +155,28 @@ async fn handle_stream_message<H: RequestHandler>(
     let params = extract_service_params(&headers);
     match state.handler.send_streaming_message(&params, req).await {
         Ok(stream) => sse::sse_from_stream(protojson_stream(stream)).into_response(),
+        Err(e) => rest_error_response(e),
+    }
+}
+
+/// `POST /message:live`: the call that opens a live exchange is its downlink
+/// (an event stream); a later call for the same task is input to it and gets
+/// the task as it stands.
+async fn handle_live_message<H: RequestHandler>(
+    State(state): State<RestState<H>>,
+    headers: HeaderMap,
+    Json(raw_req): Json<Value>,
+) -> impl IntoResponse {
+    let req = match protojson_conv::from_value::<StreamRequest>(raw_req) {
+        Ok(req) => req,
+        Err(e) => return rest_payload_error_response(e),
+    };
+    let params = extract_service_params(&headers);
+    match state.handler.send_live_request(&params, req).await {
+        Ok(LiveResponse::Stream(stream)) => {
+            sse::sse_from_stream(protojson_stream(stream)).into_response()
+        }
+        Ok(LiveResponse::Ack(task)) => protojson_json_response(&*task),
         Err(e) => rest_error_response(e),
     }
 }

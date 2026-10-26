@@ -827,6 +827,11 @@ pub enum StreamRequestPayload {
     SendMessage(SendMessageRequest),
     /// Attach to an existing task. Only valid as the first request.
     Subscribe(SubscribeToTaskRequest),
+    /// A payload kind this version does not know. It is never read from or
+    /// written to the native JSON form; the protobuf conversions use it so a
+    /// server can refuse the request (with a `StreamError`) instead of losing it.
+    #[serde(skip)]
+    Unrecognised,
 }
 
 /// Request to get an extended (authenticated) agent card.

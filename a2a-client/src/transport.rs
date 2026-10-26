@@ -6,8 +6,85 @@ use async_trait::async_trait;
 use auto_impl::auto_impl;
 use futures::stream::BoxStream;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub type ServiceParams = HashMap<String, Vec<String>>;
+
+/// The client's half of a live exchange (A2A 1.1 §3.1.12): how it sends further
+/// requests once the exchange is open.
+///
+/// A transport with native duplex (gRPC) writes them to the stream it opened.
+/// One without (JSON-RPC, REST) makes a short-lived call to the same operation
+/// for each, which the server answers with the task as it stands; that is what
+/// `send` returns there.
+#[async_trait]
+pub trait LiveUplink: Send + Sync {
+    async fn send(&self, request: StreamRequest) -> Result<Option<Task>, A2AError>;
+}
+
+/// Sends requests on a live exchange. Cheap to clone; the exchange's uplink
+/// ends when the last clone is dropped.
+#[derive(Clone)]
+pub struct LiveSender {
+    uplink: Arc<dyn LiveUplink>,
+    tenant: Option<String>,
+}
+
+impl LiveSender {
+    pub fn new(uplink: Arc<dyn LiveUplink>) -> Self {
+        LiveSender {
+            uplink,
+            tenant: None,
+        }
+    }
+
+    /// Declares the routing tenant of the selected interface, applied to every
+    /// request sent (A2A §8.3.2).
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
+    /// Sends one request. Returns the task as the server reports it when the
+    /// transport acknowledges calls (HTTP), `None` when it does not (gRPC).
+    /// Whether the server accepted the request is told on the event stream:
+    /// a rejection is a `StreamError` there.
+    pub async fn send(&self, mut request: StreamRequest) -> Result<Option<Task>, A2AError> {
+        if let Some(tenant) = &self.tenant {
+            request.tenant = Some(tenant.clone());
+            match &mut request.payload {
+                StreamRequestPayload::SendMessage(inner) => inner.tenant = Some(tenant.clone()),
+                StreamRequestPayload::Subscribe(inner) => inner.tenant = Some(tenant.clone()),
+                _ => {}
+            }
+        }
+        self.uplink.send(request).await
+    }
+
+    /// Sends `message` to the task the exchange is bound to.
+    pub async fn send_message(&self, message: Message) -> Result<Option<Task>, A2AError> {
+        self.send(StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::SendMessage(SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: None,
+                tenant: None,
+                artifact_updates: Vec::new(),
+            }),
+        })
+        .await
+    }
+}
+
+/// An open live exchange: the events of the task, and the means to send more.
+pub struct LiveConnection {
+    /// The downlink. Ends when the task does, or the server closes the
+    /// exchange.
+    pub events: BoxStream<'static, Result<StreamResponse, A2AError>>,
+    /// The uplink.
+    pub sender: LiveSender,
+}
 
 /// The extension point for all protocol bindings.
 ///
@@ -30,6 +107,19 @@ pub trait Transport: Send + Sync {
         params: &ServiceParams,
         req: &SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError>;
+
+    /// Opens a live exchange (`SendLiveMessage`, A2A 1.1 §3.1.12) with `first`,
+    /// which binds it to a task. Not every binding supports it.
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        first: &StreamRequest,
+    ) -> Result<LiveConnection, A2AError> {
+        let _ = (params, first);
+        Err(A2AError::unsupported_operation(
+            "this transport does not support SendLiveMessage",
+        ))
+    }
 
     async fn get_task(
         &self,

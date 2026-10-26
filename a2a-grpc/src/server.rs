@@ -162,11 +162,24 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
 
     async fn send_live_message(
         &self,
-        _request: tonic::Request<tonic::Streaming<proto::StreamRequest>>,
+        request: tonic::Request<tonic::Streaming<proto::StreamRequest>>,
     ) -> Result<tonic::Response<Self::SendLiveMessageStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "SendLiveMessage is not supported by this server",
-        ))
+        let params = extract_service_params(request.metadata());
+        // A request that cannot be read ends the uplink, and with it what the
+        // client can still say; the downlink goes on until the task does.
+        let uplink = request
+            .into_inner()
+            .take_while(|item| futures::future::ready(item.is_ok()))
+            .filter_map(|item| futures::future::ready(item.ok()))
+            .map(|request| pbconv::from_proto_stream_request(&request))
+            .boxed();
+        let stream = self
+            .handler
+            .send_live_message(&params, uplink)
+            .await
+            .map_err(|e| a2a_error_to_status(&e))?;
+        let proto_stream = stream.map(map_proto_stream_item);
+        Ok(tonic::Response::new(Box::pin(proto_stream)))
     }
 
     async fn create_task_push_notification_config(

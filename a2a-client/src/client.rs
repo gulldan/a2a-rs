@@ -8,6 +8,7 @@ use futures::stream::BoxStream;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::LiveConnection;
 use crate::middleware::CallInterceptor;
 use crate::transport::{ServiceParams, Transport};
 
@@ -139,6 +140,32 @@ impl<T: Transport> A2AClient<T> {
         let result = self.transport.send_streaming_message(&params, &req).await;
         self.finish_call(methods::SEND_STREAMING_MESSAGE, result)
             .await
+    }
+
+    /// Opens a live exchange (`SendLiveMessage`, A2A 1.1 §3.1.12) with `first`,
+    /// the request that binds it to a task: a message (to a task, or to create
+    /// one) or a subscription. Read the task's events from the connection and
+    /// send further messages through its sender.
+    pub async fn send_live_message(
+        &self,
+        first: &StreamRequest,
+    ) -> Result<LiveConnection, A2AError> {
+        let params = self.apply_before(methods::SEND_LIVE_MESSAGE).await?;
+        let mut first = first.clone();
+        if let Some(tenant) = &self.tenant {
+            first.tenant = Some(tenant.clone());
+            match &mut first.payload {
+                StreamRequestPayload::SendMessage(inner) => inner.tenant = Some(tenant.clone()),
+                StreamRequestPayload::Subscribe(inner) => inner.tenant = Some(tenant.clone()),
+                _ => {}
+            }
+        }
+        let result = self.transport.send_live_message(&params, &first).await;
+        let mut connection = self.finish_call(methods::SEND_LIVE_MESSAGE, result).await?;
+        if let Some(tenant) = &self.tenant {
+            connection.sender = connection.sender.with_tenant(tenant.clone());
+        }
+        Ok(connection)
     }
 
     pub async fn get_task(&self, req: &GetTaskRequest) -> Result<Task, A2AError> {

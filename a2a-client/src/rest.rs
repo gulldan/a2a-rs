@@ -18,6 +18,7 @@ use crate::wire;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
+const REST_LIVE_MESSAGE_PATH: &str = "/message:live";
 const REST_EXTENDED_AGENT_CARD_PATH: &str = "/extendedAgentCard";
 
 #[derive(Debug, Deserialize)]
@@ -36,9 +37,16 @@ struct RestErrorStatus {
 /// REST (HTTP+JSON) transport implementation.
 ///
 /// Maps A2A operations to RESTful HTTP endpoints.
+#[derive(Clone)]
 pub struct RestTransport {
     client: Client,
     base_url: String,
+}
+
+/// What a call that may either stream or answer plainly came back with.
+enum StreamOrTask {
+    Stream(BoxStream<'static, Result<StreamResponse, A2AError>>),
+    Task(Box<Task>),
 }
 
 impl RestTransport {
@@ -208,6 +216,52 @@ impl RestTransport {
         Ok(crate::jsonrpc::parse_sse_stream_rest(stream))
     }
 
+    /// `POST /message:live`: the call that opens a live exchange answers with
+    /// its events; one that only feeds an open exchange answers with the task.
+    async fn post_live(
+        &self,
+        params: &ServiceParams,
+        body: &StreamRequest,
+    ) -> Result<StreamOrTask, A2AError> {
+        let payload = protojson_conv::to_value(body).map_err(|e| {
+            A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
+        })?;
+        let resp = self
+            .send(
+                self.build_request(reqwest::Method::POST, REST_LIVE_MESSAGE_PATH, params)
+                    .header("Accept", "text/event-stream, application/json")
+                    .json(&payload),
+            )
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(Self::into_rest_error(resp).await);
+        }
+
+        let is_event_stream = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|v| v.as_bytes().starts_with(b"text/event-stream"))
+            .unwrap_or(true);
+        if is_event_stream {
+            return Ok(StreamOrTask::Stream(crate::jsonrpc::parse_sse_stream_rest(
+                resp.bytes_stream(),
+            )));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        wire::log_response(reqwest::StatusCode::OK, &body);
+        let payload = serde_json::from_str::<Value>(&body)
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        protojson_conv::from_value(payload)
+            .map(|task| StreamOrTask::Task(Box::new(task)))
+            .map_err(|e| {
+                A2AError::internal(format!("failed to deserialize response as ProtoJSON: {e}"))
+            })
+    }
+
     async fn get_streaming(
         &self,
         path: &str,
@@ -238,6 +292,27 @@ impl RestTransport {
             return Err(Self::into_rest_error(resp).await);
         }
         Ok(())
+    }
+}
+
+/// The uplink of a live exchange over REST: each request is a short-lived
+/// `POST /message:live`, which the server answers with the task.
+struct RestLiveUplink {
+    transport: RestTransport,
+    params: ServiceParams,
+}
+
+#[async_trait]
+impl crate::LiveUplink for RestLiveUplink {
+    async fn send(&self, request: StreamRequest) -> Result<Option<Task>, A2AError> {
+        match self.transport.post_live(&self.params, &request).await? {
+            StreamOrTask::Task(task) => Ok(Some(*task)),
+            // The exchange this was meant for is gone, so the server opened a
+            // new one for it. Nothing here wants that one.
+            StreamOrTask::Stream(_) => Err(A2AError::invalid_request(
+                "the live exchange is no longer open",
+            )),
+        }
     }
 }
 
@@ -286,6 +361,26 @@ impl Transport for RestTransport {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.post_streaming(REST_STREAM_MESSAGE_PATH, params, req)
             .await
+    }
+
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        first: &StreamRequest,
+    ) -> Result<crate::LiveConnection, A2AError> {
+        match self.post_live(params, first).await? {
+            StreamOrTask::Stream(events) => Ok(crate::LiveConnection {
+                events,
+                sender: crate::LiveSender::new(std::sync::Arc::new(RestLiveUplink {
+                    transport: self.clone(),
+                    params: params.clone(),
+                })),
+            }),
+            // The task already has an open exchange: this call was input to it.
+            StreamOrTask::Task(_) => Err(A2AError::invalid_request(
+                "a live exchange is already open for this task",
+            )),
+        }
     }
 
     async fn get_task(

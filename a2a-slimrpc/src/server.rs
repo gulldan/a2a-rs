@@ -15,8 +15,9 @@ use crate::common::{
     A2A_COLLABORATIVE_CHANNEL_SERVICE, A2A_SLIMRPC_SERVICE, METHOD_CANCEL_TASK, METHOD_COLLABORATE,
     METHOD_CREATE_PUSH_CONFIG, METHOD_DELETE_PUSH_CONFIG, METHOD_GET_EXTENDED_AGENT_CARD,
     METHOD_GET_PUSH_CONFIG, METHOD_GET_TASK, METHOD_LIST_PUSH_CONFIGS, METHOD_LIST_TASKS,
-    METHOD_SEND_MESSAGE, METHOD_SEND_STREAMING_MESSAGE, METHOD_SUBSCRIBE_TO_TASK, ServiceParamsMap,
-    context_to_service_params, decode_proto_request, encode_proto_message,
+    METHOD_SEND_LIVE_MESSAGE, METHOD_SEND_MESSAGE, METHOD_SEND_STREAMING_MESSAGE,
+    METHOD_SUBSCRIBE_TO_TASK, ServiceParamsMap, context_to_service_params, decode_proto_request,
+    encode_proto_message,
 };
 use crate::errors::a2a_error_to_rpc_error;
 
@@ -84,6 +85,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
         );
 
         register_unary_stream_subscribe_to_task(server, self.handler.clone());
+        register_stream_stream_send_live_message(server, self.handler.clone());
 
         register_unary_unary::<H, proto::TaskPushNotificationConfig, _, _, _, _>(
             server,
@@ -262,6 +264,43 @@ where
                 let request = pbconv::from_proto_send_message_request(&proto_request);
                 let stream = handler
                     .send_streaming_message(&params, request)
+                    .await
+                    .map_err(|error| a2a_error_to_rpc_error(&error))?;
+
+                Ok(stream.map(map_stream_response))
+            }
+        },
+    );
+}
+
+/// `SendLiveMessage`: the client's requests are the uplink stream, the task's
+/// events the reply stream, for as long as the exchange lasts.
+fn register_stream_stream_send_live_message<H>(server: &slim_rpc::Server, handler: Arc<H>)
+where
+    H: RequestHandler,
+{
+    server.register_stream_stream::<_, Vec<u8>, Vec<u8>, _, _>(
+        A2A_SLIMRPC_SERVICE,
+        METHOD_SEND_LIVE_MESSAGE,
+        move |requests: slim_rpc::DecodedStream<Vec<u8>>, context: slim_rpc::Context| {
+            let handler = handler.clone();
+
+            async move {
+                let params = context_to_service_params(&context);
+                // A request that cannot be read ends the uplink, and with it
+                // what the client can still say; the downlink goes on.
+                let uplink = requests
+                    .take_while(|item| futures::future::ready(item.is_ok()))
+                    .filter_map(|item| async move {
+                        let bytes = item.ok()?;
+                        let proto_request =
+                            decode_proto_request::<proto::StreamRequest>(bytes, "StreamRequest")
+                                .ok()?;
+                        Some(pbconv::from_proto_stream_request(&proto_request))
+                    })
+                    .boxed();
+                let stream = handler
+                    .send_live_message(&params, uplink)
                     .await
                     .map_err(|error| a2a_error_to_rpc_error(&error))?;
 

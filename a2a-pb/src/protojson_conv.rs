@@ -7,8 +7,8 @@ use a2a::{
     AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
     GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
-    ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
-    SubscribeToTaskRequest, Task, TaskPushNotificationConfig,
+    ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamRequest,
+    StreamResponse, SubscribeToTaskRequest, Task, TaskPushNotificationConfig,
 };
 use prost::Message;
 use serde::{Serialize, de::DeserializeOwned};
@@ -267,6 +267,13 @@ impl_protojson_payload_optional!(
     crate::protojson::SendMessageResponse,
     crate::pbconv::to_proto_send_message_response,
     crate::pbconv::from_proto_send_message_response
+);
+impl_protojson_payload!(
+    StreamRequest,
+    crate::proto::StreamRequest,
+    crate::protojson::StreamRequest,
+    crate::pbconv::to_proto_stream_request,
+    crate::pbconv::from_proto_stream_request
 );
 impl_protojson_payload_optional!(
     StreamResponse,

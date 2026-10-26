@@ -323,7 +323,7 @@ fn stream_request_round_trips() {
 
     for request in [send, subscribe] {
         let back = pbconv::from_proto_stream_request(&pbconv::to_proto_stream_request(&request));
-        assert_eq!(back.as_ref(), Some(&request));
+        assert_eq!(back, request);
     }
 }
 
@@ -452,4 +452,21 @@ fn an_artifact_only_request_is_a_fixed_point_of_the_json_conversion() {
             protojson_conv::from_value(protojson_conv::to_value(&once).unwrap()).unwrap();
         assert_eq!(once, twice, "{request:?}");
     }
+
+fn a_stream_request_with_an_unknown_payload_is_kept_to_be_refused() {
+    let unknown = a2a_pb::proto::StreamRequest {
+        tenant: "acme".into(),
+        payload: None,
+    };
+
+    let native = pbconv::from_proto_stream_request(&unknown);
+
+    assert_eq!(native.payload, StreamRequestPayload::Unrecognised);
+    assert_eq!(native.tenant.as_deref(), Some("acme"));
+    // It travels back as the empty payload it came in as.
+    assert_eq!(pbconv::to_proto_stream_request(&native), unknown);
+    // And as ProtoJSON, a payload kind of a later version reads the same way.
+    let from_json: StreamRequest =
+        protojson_conv::from_value(json!({"tenant": "acme", "somethingNew": {"x": 1}})).unwrap();
+    assert_eq!(from_json.payload, StreamRequestPayload::Unrecognised);
 }

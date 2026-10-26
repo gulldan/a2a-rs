@@ -15,7 +15,7 @@ use axum::{
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 
-use crate::handler::RequestHandler;
+use crate::handler::{LiveResponse, RequestHandler};
 use crate::middleware::{ServiceParams, extract_service_params};
 use crate::sse;
 
@@ -231,6 +231,23 @@ async fn handle_streaming_request<H: RequestHandler>(
                     Ok(stream) => {
                         sse::sse_jsonrpc_stream(id, protojson_stream(stream)).into_response()
                     }
+                    Err(e) => error_response(id, e),
+                },
+                Err(e) => error_response(id, invalid_params(e)),
+            }
+        }
+        methods::SEND_LIVE_MESSAGE => {
+            match protojson_conv::from_value::<StreamRequest>(raw_params) {
+                Ok(req) => match state.handler.send_live_request(params, req).await {
+                    // The call that opens the exchange is its downlink.
+                    Ok(LiveResponse::Stream(stream)) => {
+                        sse::sse_jsonrpc_stream(id, protojson_stream(stream)).into_response()
+                    }
+                    // A later call is input to it and only gets the task back.
+                    Ok(LiveResponse::Ack(task)) => match protojson_value(&*task) {
+                        Ok(value) => Json(JsonRpcResponse::success(id, value)).into_response(),
+                        Err(e) => error_response(id, e),
+                    },
                     Err(e) => error_response(id, e),
                 },
                 Err(e) => error_response(id, invalid_params(e)),

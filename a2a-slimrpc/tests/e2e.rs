@@ -418,6 +418,113 @@ impl RequestHandler for TestHandler {
     ) -> Result<AgentCard, A2AError> {
         Ok(sample_agent_card(&format!("slimrpc://{}", self.target)))
     }
+
+    /// Opens with a task, then answers every message it is sent until "finish".
+    async fn send_live_message(
+        &self,
+        _params: &ServiceParams,
+        uplink: BoxStream<'static, StreamRequest>,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        let events = stream::once(async {
+            Ok(StreamResponse::Task(sample_task(
+                "live-task",
+                TaskState::Working,
+            )))
+        })
+        .chain(
+            uplink
+                // The first request opened the exchange; the rest are answered.
+                .skip(1)
+                .map(|request| match request.payload {
+                    StreamRequestPayload::SendMessage(message) => {
+                        message.message.text().unwrap_or("").to_string()
+                    }
+                    _ => String::new(),
+                })
+                .take_while(|text| futures::future::ready(text != "finish"))
+                .map(|text| {
+                    Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                        generation: 0,
+                        task_id: "live-task".to_string(),
+                        context_id: "ctx-1".to_string(),
+                        status: TaskStatus {
+                            state: TaskState::Working,
+                            message: Some(Message::new(
+                                Role::Agent,
+                                vec![Part::text(format!("echo: {text}"))],
+                            )),
+                            timestamp: None,
+                        },
+                        metadata: None,
+                    }))
+                }),
+        )
+        .chain(stream::once(async {
+            Ok(StreamResponse::Task(sample_task(
+                "live-task",
+                TaskState::Completed,
+            )))
+        }));
+        Ok(Box::pin(events))
+    }
+}
+
+#[tokio::test]
+async fn slimrpc_carries_a_live_exchange() {
+    let env = TestEnv::new("transport-live").await;
+    let handler = Arc::new(TestHandler {
+        target: env.target(),
+    });
+    SlimRpcHandler::new(handler).register(&env.server);
+    env.start().await;
+    let transport = env.transport("live").await;
+
+    let first = StreamRequest {
+        tenant: None,
+        payload: StreamRequestPayload::SendMessage(send_message_request("start")),
+    };
+    let mut live = transport
+        .send_live_message(&ServiceParams::new(), &first)
+        .await
+        .expect("the exchange opens");
+    let opening = tokio::time::timeout(Duration::from_secs(10), live.events.next())
+        .await
+        .expect("an event arrives")
+        .expect("the stream is open")
+        .expect("no transport error");
+    assert!(matches!(opening, StreamResponse::Task(task) if task.id == "live-task"));
+
+    live.sender
+        .send_message(Message::new(Role::User, vec![Part::text("hello")]))
+        .await
+        .expect("the request is sent");
+    let echoed = tokio::time::timeout(Duration::from_secs(10), live.events.next())
+        .await
+        .expect("an event arrives")
+        .expect("the stream is open")
+        .expect("no transport error");
+    match echoed {
+        StreamResponse::StatusUpdate(update) => assert_eq!(
+            update.status.message.as_ref().and_then(|m| m.text()),
+            Some("echo: hello")
+        ),
+        other => panic!("expected the echo, got {other:?}"),
+    }
+
+    live.sender
+        .send_message(Message::new(Role::User, vec![Part::text("finish")]))
+        .await
+        .expect("the request is sent");
+    let done = tokio::time::timeout(Duration::from_secs(10), live.events.next())
+        .await
+        .expect("an event arrives")
+        .expect("the stream is open")
+        .expect("no transport error");
+    assert!(
+        matches!(&done, StreamResponse::Task(task) if task.status.state == TaskState::Completed),
+        "{done:?}"
+    );
+    env.shutdown().await;
 }
 
 #[tokio::test]

@@ -978,6 +978,7 @@ pub fn to_proto_stream_request(r: &StreamRequest) -> proto::StreamRequest {
         StreamRequestPayload::Subscribe(s) => Some(proto::stream_request::Payload::Subscribe(
             to_proto_subscribe_to_task_request(s),
         )),
+        StreamRequestPayload::Unrecognised => None,
         _ => None,
     };
     proto::StreamRequest {
@@ -986,20 +987,22 @@ pub fn to_proto_stream_request(r: &StreamRequest) -> proto::StreamRequest {
     }
 }
 
-/// `None` when the request carries no payload this version understands.
-pub fn from_proto_stream_request(r: &proto::StreamRequest) -> Option<StreamRequest> {
-    let payload = match r.payload.as_ref()? {
-        proto::stream_request::Payload::SendMessage(m) => {
+/// A request whose payload this version does not understand comes back with
+/// [`StreamRequestPayload::Unrecognised`], so it can be refused rather than lost.
+pub fn from_proto_stream_request(r: &proto::StreamRequest) -> StreamRequest {
+    let payload = match r.payload.as_ref() {
+        Some(proto::stream_request::Payload::SendMessage(m)) => {
             StreamRequestPayload::SendMessage(from_proto_send_message_request(m))
         }
-        proto::stream_request::Payload::Subscribe(s) => {
+        Some(proto::stream_request::Payload::Subscribe(s)) => {
             StreamRequestPayload::Subscribe(from_proto_subscribe_to_task_request(s))
         }
+        None => StreamRequestPayload::Unrecognised,
     };
-    Some(StreamRequest {
+    StreamRequest {
         tenant: empty_to_none(&r.tenant),
         payload,
-    })
+    }
 }
 
 pub fn to_proto_stream_response(r: &StreamResponse) -> proto::StreamResponse {
