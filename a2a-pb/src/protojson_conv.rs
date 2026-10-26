@@ -326,6 +326,8 @@ mod tests {
 
     fn sample_task_with_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Task {
         Task {
+            generation: 0,
+            timeline: None,
             id: "task-1".to_string(),
             context_id: "ctx-1".to_string(),
             status: a2a::TaskStatus {

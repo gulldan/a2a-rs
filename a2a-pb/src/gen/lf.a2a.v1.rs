@@ -12,12 +12,20 @@ pub struct SendMessageConfiguration {
     pub task_push_notification_config: ::core::option::Option<
         TaskPushNotificationConfig,
     >,
-    /// The maximum number of most recent messages from the task's history to retrieve in
-    /// the response. An unset value means the client does not impose any limit. A
-    /// value of zero is a request to not include any messages. The server MUST NOT
-    /// return more messages than the provided value, but MAY apply a lower limit.
+    /// Deprecated: use `timeline_length` instead. The maximum number of most recent
+    /// messages from the task's history to retrieve in the response. An unset value
+    /// means the client does not impose any limit. A value of zero is a request to
+    /// not include any messages. The server MUST NOT return more messages than the
+    /// provided value, but MAY apply a lower limit. Removed in 2.0. See ADR-002.
+    #[deprecated]
     #[prost(int32, optional, tag = "3")]
     pub history_length: ::core::option::Option<i32>,
+    /// Optional. The maximum number of most recent `timeline` entries to retrieve
+    /// in the response. An unset value means the client does not impose any limit;
+    /// a value of zero requests no entries. The server MUST NOT return more entries
+    /// than this value, but MAY apply a lower limit. See ADR-002.
+    #[prost(int32, optional, tag = "6")]
+    pub timeline_length: ::core::option::Option<i32>,
     /// If `true`, the operation returns immediately after creating the task,
     /// even if processing is still in progress.
     /// If `false` (default), the operation MUST wait until the task reaches a
@@ -25,6 +33,13 @@ pub struct SendMessageConfiguration {
     /// (`INPUT_REQUIRED`, `AUTH_REQUIRED`) state before returning.
     #[prost(bool, tag = "4")]
     pub return_immediately: bool,
+    /// Optional. If set, the server MUST reject the request with an appropriate
+    /// error (HTTP 409 Conflict / gRPC ABORTED) if the task's
+    /// current generation does not equal this value at the time the message is
+    /// processed. Use this to implement optimistic concurrency control and
+    /// prevent lost-update races when multiple clients interact with the same task.
+    #[prost(int64, optional, tag = "5")]
+    pub if_generation_match: ::core::option::Option<i64>,
 }
 /// `Task` is the core unit of action for A2A. It has a current status
 /// and when results are created for the task they are stored in the
@@ -47,13 +62,32 @@ pub struct Task {
     #[prost(message, repeated, tag = "4")]
     pub artifacts: ::prost::alloc::vec::Vec<Artifact>,
     /// protolint:disable REPEATED_FIELD_NAMES_PLURALIZED
-    /// The history of interactions from a `Task`.
+    /// Deprecated: read the task `timeline` instead, which records the interaction
+    /// (agent status entries and client messages) in generation order. Servers
+    /// continue to populate `history` throughout the v1.x line for backward
+    /// compatibility; it is removed in 2.0. See ADR-002.
+    #[deprecated]
     #[prost(message, repeated, tag = "5")]
     pub history: ::prost::alloc::vec::Vec<Message>,
+    /// Optional. The coherent, generation-ordered record of the interaction: agent
+    /// status entries and client messages. Each status entry corresponds to a
+    /// `TaskStatusUpdateEvent` already delivered on the wire, so no new event type
+    /// is required to stream it. See ADR-002.
+    #[prost(message, repeated, tag = "8")]
+    pub timeline: ::prost::alloc::vec::Vec<TimelineEntry>,
     /// protolint:enable REPEATED_FIELD_NAMES_PLURALIZED
     /// A key/value object to store custom metadata about a task.
     #[prost(message, optional, tag = "6")]
     pub metadata: ::core::option::Option<::prost_types::Struct>,
+    /// Sequentially increasing counter incremented by exactly 1 by the server on
+    /// every state-changing mutation to this task, with each mutation mapping 1:1
+    /// to one event. Mutations include: a status update recorded as a
+    /// `TimelineEntry` (any `TaskStatusUpdateEvent`, including a progress message
+    /// that does not change `TaskState`); and an `Artifact` addition or update.
+    /// Starts at 1 when the task is created.
+    /// May be used for event ordering, long-polling, and optimistic concurrency.
+    #[prost(int64, tag = "7")]
+    pub generation: i64,
 }
 /// A container for the status of a task
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -159,6 +193,76 @@ pub struct Artifact {
     /// The URIs of extensions that are present or contributed to this Artifact.
     #[prost(string, repeated, tag = "6")]
     pub extensions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Optional. The task `generation` at which this artifact first appeared.
+    #[prost(int64, tag = "7")]
+    pub start_generation: i64,
+    /// Optional. The task `generation` at which this artifact was completed; unset
+    /// while it is still streaming.
+    #[prost(int64, tag = "8")]
+    pub end_generation: i64,
+    /// Optional. The originator of this artifact. Artifacts are agent outputs by
+    /// default (`ROLE_AGENT`); an artifact written by the client is `ROLE_USER`.
+    #[prost(enumeration = "Role", tag = "9")]
+    pub role: i32,
+}
+/// `TimelineEntry` is a single, generation-ordered entry in a task's timeline.
+/// The timeline is the coherent, replayable record of the interaction on the
+/// wire: agent status progression (each `TaskStatus` carrying the agent's
+/// `message` and state) interleaved with client messages, in the order they
+/// occurred. Agent status entries are delivered on the wire by the existing
+/// `TaskStatusUpdateEvent`, so the timeline needs no new event type. The `entry`
+/// is a `oneof` so additional entry kinds can be added later; clients MUST fail
+/// open and skip an entry whose `entry` kind they do not recognise (its
+/// `generation` is still accounted for). See ADR-002.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TimelineEntry {
+    /// The task's `generation` at the point this entry was appended. Entries are
+    /// ordered by this value, establishing a total order independent of wall-clock
+    /// time. These values are monotonic but NOT contiguous: other mutations
+    /// (notably `Artifact` updates) also advance `generation`, so gaps between
+    /// entries are expected, and artifacts are placed relative to entries via their
+    /// `start_generation`/`end_generation` (see `Task.generation`).
+    #[prost(int64, tag = "3")]
+    pub generation: i64,
+    /// The content of this timeline entry.
+    #[prost(oneof = "timeline_entry::Entry", tags = "1, 2")]
+    pub entry: ::core::option::Option<timeline_entry::Entry>,
+}
+/// Nested message and enum types in `TimelineEntry`.
+pub mod timeline_entry {
+    /// The content of this timeline entry.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Entry {
+        /// A standalone message recorded in the timeline, used for client input
+        /// (`ROLE_USER`). Agent messages are carried by `status` entries.
+        #[prost(message, tag = "1")]
+        Message(super::Message),
+        /// An agent status recorded in the timeline: the state plus the agent's
+        /// `message` at that point. Streamed via `TaskStatusUpdateEvent`.
+        #[prost(message, tag = "2")]
+        Status(super::TaskStatus),
+    }
+}
+/// An event sent by the server to notify clients of a new message added to the task (e.g. client input).
+/// Emitted only to clients that negotiated a compatible protocol version (>= 1.1).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TaskMessageUpdateEvent {
+    /// The ID of the task that the message belongs to.
+    #[prost(string, tag = "1")]
+    pub task_id: ::prost::alloc::string::String,
+    /// The ID of the context that this task belongs to.
+    #[prost(string, tag = "2")]
+    pub context_id: ::prost::alloc::string::String,
+    /// The message that was appended to the task.
+    #[prost(message, optional, tag = "3")]
+    pub message: ::core::option::Option<Message>,
+    /// Optional. Metadata associated with the message update.
+    #[prost(message, optional, tag = "4")]
+    pub metadata: ::core::option::Option<::prost_types::Struct>,
+    /// The task's `generation` after this message was appended, allowing clients
+    /// to order it correctly in the timeline and detect missed events.
+    #[prost(int64, tag = "5")]
+    pub generation: i64,
 }
 /// An event sent by the agent to notify the client of a change in a task's status.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -175,6 +279,11 @@ pub struct TaskStatusUpdateEvent {
     /// Optional. Metadata associated with the task update.
     #[prost(message, optional, tag = "4")]
     pub metadata: ::core::option::Option<::prost_types::Struct>,
+    /// The task's generation after this update was applied. Clients can use this
+    /// to detect missed events (a gap in generation values) and to correlate
+    /// events with a specific task snapshot.
+    #[prost(int64, tag = "5")]
+    pub generation: i64,
 }
 /// A task delta where an artifact has been generated.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -198,6 +307,11 @@ pub struct TaskArtifactUpdateEvent {
     /// Optional. Metadata associated with the artifact update.
     #[prost(message, optional, tag = "6")]
     pub metadata: ::core::option::Option<::prost_types::Struct>,
+    /// The task's generation after this artifact update was applied. Clients can
+    /// use this to detect missed events (a gap in generation values) and to
+    /// correlate events with a specific task snapshot.
+    #[prost(int64, tag = "7")]
+    pub generation: i64,
 }
 /// Defines authentication details, used for push notifications.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -215,9 +329,8 @@ pub struct AuthenticationInfo {
 /// This allows agents to expose the same functionality over multiple protocol binding mechanisms.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AgentInterface {
-    /// The URL or address where this interface is available. For HTTP-based transports, must be a valid absolute
-    /// HTTPS URL in production. For gRPC, the address should be in the format "hostname:port".
-    /// Example: "<https://api.example.com/a2a/v1",> "grpc.example.com:443"
+    /// The URL where this interface is available. Must be a valid absolute HTTPS URL in production.
+    /// Example: "<https://api.example.com/a2a/v1",> "<https://grpc.example.com/a2a">
     #[prost(string, tag = "1")]
     pub url: ::prost::alloc::string::String,
     /// The protocol binding supported at this URL. This is an open form string, to be
@@ -326,6 +439,10 @@ pub struct AgentCapabilities {
     /// Indicates if the agent supports providing an extended agent card when authenticated.
     #[prost(bool, optional, tag = "4")]
     pub extended_agent_card: ::core::option::Option<bool>,
+    /// Indicates if the agent accepts client-written artifacts (`ROLE_USER`) in
+    /// `SendMessageRequest.artifact_updates`.
+    #[prost(bool, optional, tag = "5")]
+    pub user_artifacts: ::core::option::Option<bool>,
 }
 /// A declaration of a protocol extension supported by an Agent.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -411,6 +528,11 @@ pub struct TaskPushNotificationConfig {
     /// Authentication information required to send the notification.
     #[prost(message, optional, tag = "6")]
     pub authentication: ::core::option::Option<AuthenticationInfo>,
+    /// Optional. The A2A protocol version to use when delivering the notification.
+    /// Defaults to the version of the request that created the configuration,
+    /// or "1.0" if unset.
+    #[prost(string, tag = "7")]
+    pub protocol_version: ::prost::alloc::string::String,
 }
 /// protolint:disable REPEATED_FIELD_NAMES_PLURALIZED
 /// A list of strings.
@@ -650,7 +772,9 @@ pub struct SendMessageRequest {
     /// the selected `AgentInterface` in the Agent Card when that field is set.
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
-    /// The message to send to the agent.
+    /// The message to send to the agent. Required when creating a task (when no
+    /// `task_id` is provided); may be omitted only when sending `artifact_updates`
+    /// to an existing task.
     #[prost(message, optional, tag = "2")]
     pub message: ::core::option::Option<Message>,
     /// Configuration for the send request.
@@ -659,6 +783,42 @@ pub struct SendMessageRequest {
     /// A flexible key-value map for passing additional context or parameters.
     #[prost(message, optional, tag = "4")]
     pub metadata: ::core::option::Option<::prost_types::Struct>,
+    /// Optional. Client-written artifact updates to send alongside `message` (for
+    /// example, initial input artifacts when creating a task) or on their own to
+    /// an existing task. Requires `AgentCard.capabilities.user_artifacts` to be
+    /// `true`. The `generation` field on each update is owned by the server:
+    /// clients MUST leave it unset and servers MUST ignore any value sent.
+    #[prost(message, repeated, tag = "5")]
+    pub artifact_updates: ::prost::alloc::vec::Vec<TaskArtifactUpdateEvent>,
+}
+/// A wrapper object used in streaming operations to encapsulate different types of client input.
+/// New `payload` kinds MAY be added in future minor versions. A server that
+/// receives a request whose payload kind it does not recognise MUST reject that
+/// request (on a live stream, with a `StreamError`) rather than terminating the
+/// stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamRequest {
+    /// Optional. Opaque routing identifier. Must match the `tenant` value from
+    /// the selected `AgentInterface` in the Agent Card when that field is set.
+    #[prost(string, tag = "1")]
+    pub tenant: ::prost::alloc::string::String,
+    /// The payload of the stream request.
+    #[prost(oneof = "stream_request::Payload", tags = "2, 3")]
+    pub payload: ::core::option::Option<stream_request::Payload>,
+}
+/// Nested message and enum types in `StreamRequest`.
+pub mod stream_request {
+    /// The payload of the stream request.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        /// Send a message on the stream, optionally with per-request configuration.
+        #[prost(message, tag = "2")]
+        SendMessage(super::SendMessageRequest),
+        /// Attach to an existing task. Only valid as the first request of a stream;
+        /// a server that receives it later MUST reject it with a `StreamError`.
+        #[prost(message, tag = "3")]
+        Subscribe(super::SubscribeToTaskRequest),
+    }
 }
 /// Represents a request for the `GetTask` method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -670,12 +830,27 @@ pub struct GetTaskRequest {
     /// The resource ID of the task to retrieve.
     #[prost(string, tag = "2")]
     pub id: ::prost::alloc::string::String,
-    /// The maximum number of most recent messages from the task's history to retrieve. An
-    /// unset value means the client does not impose any limit. A value of zero is
-    /// a request to not include any messages. The server MUST NOT return more
-    /// messages than the provided value, but MAY apply a lower limit.
+    /// Deprecated: use `timeline_length` instead. The maximum number of most recent
+    /// messages from the task's history to retrieve. An unset value means the
+    /// client does not impose any limit. A value of zero is a request to not
+    /// include any messages. The server MUST NOT return more messages than the
+    /// provided value, but MAY apply a lower limit. Removed in 2.0. See ADR-002.
+    #[deprecated]
     #[prost(int32, optional, tag = "3")]
     pub history_length: ::core::option::Option<i32>,
+    /// Optional. The maximum number of most recent `timeline` entries to retrieve.
+    /// An unset value means the client does not impose any limit; a value of zero
+    /// requests no entries. The server MUST NOT return more entries than this
+    /// value, but MAY apply a lower limit. See ADR-002.
+    #[prost(int32, optional, tag = "5")]
+    pub timeline_length: ::core::option::Option<i32>,
+    /// Optional. If set, the server SHOULD NOT return until the task's generation
+    /// is strictly greater than this value, enabling efficient long-polling.
+    /// The server MAY return earlier (e.g. on timeout) with the current task state.
+    /// If the task's current generation already exceeds this value the server
+    /// MUST return immediately.
+    #[prost(int64, optional, tag = "4")]
+    pub current_generation: ::core::option::Option<i64>,
 }
 /// Parameters for listing tasks with optional filtering criteria.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -701,9 +876,15 @@ pub struct ListTasksRequest {
     /// Provide this to retrieve the subsequent page.
     #[prost(string, tag = "5")]
     pub page_token: ::prost::alloc::string::String,
-    /// The maximum number of messages to include in each task's history.
+    /// Deprecated: use `timeline_length` instead. The maximum number of messages to
+    /// include in each task's history. Removed in 2.0. See ADR-002.
+    #[deprecated]
     #[prost(int32, optional, tag = "6")]
     pub history_length: ::core::option::Option<i32>,
+    /// Optional. The maximum number of `timeline` entries to include in each task.
+    /// See ADR-002.
+    #[prost(int32, optional, tag = "9")]
+    pub timeline_length: ::core::option::Option<i32>,
     /// Filter tasks which have a status updated after the provided timestamp in ISO 8601 format (e.g., "2023-10-27T10:00:00Z").
     /// Only tasks with a status timestamp time greater than or equal to this value will be returned.
     #[prost(message, optional, tag = "7")]
@@ -781,6 +962,11 @@ pub struct SubscribeToTaskRequest {
     /// The resource ID of the task to subscribe to.
     #[prost(string, tag = "2")]
     pub id: ::prost::alloc::string::String,
+    /// Optional. Resume after this `generation`: the server replays only what
+    /// followed it and does NOT open with a `Task` snapshot. When unset, the
+    /// server opens with a `Task` snapshot and streams onward from it.
+    #[prost(int64, optional, tag = "3")]
+    pub last_seen_generation: ::core::option::Option<i64>,
 }
 /// Represents a request for the `ListTaskPushNotificationConfigs` method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -828,10 +1014,13 @@ pub mod send_message_response {
     }
 }
 /// A wrapper object used in streaming operations to encapsulate different types of response data.
+/// New `payload` kinds MAY be added in future minor versions. A client that
+/// receives a response whose payload kind it does not recognise MUST skip it and
+/// continue reading the stream, rather than failing or closing the stream.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamResponse {
     /// The payload of the stream response.
-    #[prost(oneof = "stream_response::Payload", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "stream_response::Payload", tags = "1, 2, 3, 4, 5, 6")]
     pub payload: ::core::option::Option<stream_response::Payload>,
 }
 /// Nested message and enum types in `StreamResponse`.
@@ -851,7 +1040,39 @@ pub mod stream_response {
         /// An event indicating a task artifact update.
         #[prost(message, tag = "4")]
         ArtifactUpdate(super::TaskArtifactUpdateEvent),
+        /// An event indicating a new message was appended to the task (e.g. client input).
+        #[prost(message, tag = "5")]
+        MessageUpdate(super::TaskMessageUpdateEvent),
+        /// A non-fatal rejection of a single client request on the uplink.
+        #[prost(message, tag = "6")]
+        Error(super::StreamError),
     }
+}
+/// A non-fatal error reported on a live stream. It rejects a single client
+/// request without terminating the stream, so the client can correct and retry.
+/// Conditions that make the stream itself unusable remain transport-level errors
+/// and close the stream as before.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamError {
+    /// The ID of the task the rejected request applied to, when known.
+    #[prost(string, tag = "1")]
+    pub task_id: ::prost::alloc::string::String,
+    /// A machine-readable identifier for the rejection, using the same codes as
+    /// the equivalent unary operation (e.g. `INVALID_ARGUMENT` for a malformed
+    /// request, `UNAVAILABLE` when the agent is not accepting input right now).
+    #[prost(string, tag = "2")]
+    pub code: ::prost::alloc::string::String,
+    /// A human readable description of why the request was rejected.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+    /// Optional. The `message_id` of the rejected client `Message`, or the
+    /// `artifact_id` of the rejected artifact update, so the client can correlate
+    /// the rejection with what it sent.
+    #[prost(string, tag = "4")]
+    pub reference_id: ::prost::alloc::string::String,
+    /// Optional. Metadata associated with the rejection.
+    #[prost(message, optional, tag = "5")]
+    pub metadata: ::core::option::Option<::prost_types::Struct>,
 }
 /// Represents a successful response for the `ListTaskPushNotificationConfigs`
 /// method.
@@ -865,6 +1086,14 @@ pub struct ListTaskPushNotificationConfigsResponse {
     pub next_page_token: ::prost::alloc::string::String,
 }
 /// Defines the possible lifecycle states of a `Task`.
+///
+/// States are either terminal or non-terminal. Terminal states (COMPLETED,
+/// FAILED, CANCELED, REJECTED) end the task: the server accepts no further
+/// messages or updates for it. Non-terminal states, including the interrupted
+/// states INPUT_REQUIRED and AUTH_REQUIRED, leave the task lifecycle under the
+/// server's control: the server may continue processing the task and transition
+/// it to another state (including out of an interrupted state) without a message
+/// from the client, and may accept further messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TaskState {
@@ -1098,6 +1327,31 @@ pub mod a2a_service_client {
             req.extensions_mut()
                 .insert(GrpcMethod::new("lf.a2a.v1.A2AService", "SendStreamingMessage"));
             self.inner.server_streaming(req, path, codec).await
+        }
+        /// Establishes a bidirectional stream for live interaction.
+        pub async fn send_live_message(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::StreamRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::StreamResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lf.a2a.v1.A2AService/SendLiveMessage",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("lf.a2a.v1.A2AService", "SendLiveMessage"));
+            self.inner.streaming(req, path, codec).await
         }
         /// Gets the latest state of a task.
         pub async fn get_task(
@@ -1379,6 +1633,20 @@ pub mod a2a_service_server {
             tonic::Response<Self::SendStreamingMessageStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the SendLiveMessage method.
+        type SendLiveMessageStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::StreamResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Establishes a bidirectional stream for live interaction.
+        async fn send_live_message(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::StreamRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::SendLiveMessageStream>,
+            tonic::Status,
+        >;
         /// Gets the latest state of a task.
         async fn get_task(
             &self,
@@ -1616,6 +1884,54 @@ pub mod a2a_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lf.a2a.v1.A2AService/SendLiveMessage" => {
+                    #[allow(non_camel_case_types)]
+                    struct SendLiveMessageSvc<T: A2aService>(pub Arc<T>);
+                    impl<
+                        T: A2aService,
+                    > tonic::server::StreamingService<super::StreamRequest>
+                    for SendLiveMessageSvc<T> {
+                        type Response = super::StreamResponse;
+                        type ResponseStream = T::SendLiveMessageStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::StreamRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as A2aService>::send_live_message(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SendLiveMessageSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
