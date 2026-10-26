@@ -8,10 +8,34 @@ use std::collections::HashMap;
 
 use crate::middleware::{ServiceParams, User};
 
+/// A client message that reached a running execution on a live stream
+/// (`SendLiveMessage`).
+///
+/// By the time an executor reads it the server has already appended it to the
+/// task's timeline and announced it to the subscribers; the executor decides
+/// what the message means for its work.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ClientInput {
+    /// The message the client sent.
+    pub message: Message,
+    /// The task generation at which the message was appended to the timeline.
+    pub generation: i64,
+}
+
+impl ClientInput {
+    pub fn new(message: Message, generation: i64) -> Self {
+        ClientInput {
+            message,
+            generation,
+        }
+    }
+}
+
 /// Context passed to the [`AgentExecutor`] for each execution.
 ///
-/// Non-exhaustive: fields are added as the protocol grows (live input is next),
-/// and only the handler builds one.
+/// Non-exhaustive: fields are added as the protocol grows, and only the
+/// handler builds one.
 #[non_exhaustive]
 pub struct ExecutorContext {
     /// The message that triggered execution. `None` for a cancellation, and for
@@ -31,6 +55,11 @@ pub struct ExecutorContext {
     pub service_params: ServiceParams,
     /// Optional tenant ID.
     pub tenant: Option<String>,
+    /// Client messages that arrive while this execution runs, from a live
+    /// stream. Present only when [`AgentExecutor::accepts_live_input`] is true;
+    /// the executor reads it alongside its own work, and it ends when the
+    /// execution does.
+    pub inputs: Option<tokio::sync::mpsc::Receiver<ClientInput>>,
 }
 
 impl ExecutorContext {
@@ -48,7 +77,13 @@ impl ExecutorContext {
             user: None,
             service_params: ServiceParams::new(),
             tenant: None,
+            inputs: None,
         }
+    }
+
+    pub fn with_inputs(mut self, inputs: tokio::sync::mpsc::Receiver<ClientInput>) -> Self {
+        self.inputs = Some(inputs);
+        self
     }
 
     pub fn with_message(mut self, message: Message) -> Self {
@@ -99,6 +134,15 @@ pub trait AgentExecutor: Send + Sync + 'static {
 
     /// Cancel an in-progress task. Returns a stream of events.
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>>;
+
+    /// Whether this executor reads [`ExecutorContext::inputs`]: client messages
+    /// sent on a live stream while it is working. Off by default, in which case
+    /// such a message is declined (a `StreamError`) while the execution runs,
+    /// which the protocol allows; it is accepted as a new turn once the task is
+    /// idle again.
+    fn accepts_live_input(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +160,7 @@ mod tests {
             user: None,
             service_params: HashMap::new(),
             tenant: None,
+            inputs: None,
         };
         let (tid, cid) = ctx.task_info();
         assert_eq!(tid, "t1");

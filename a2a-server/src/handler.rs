@@ -6,13 +6,28 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Notify, RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast, mpsc, oneshot};
 
+use crate::executor::ClientInput;
 use crate::middleware::ServiceParams;
 use crate::pagination::resolve_page_size;
 use crate::task_store::{apply_history_length, apply_timeline_length};
 
+mod live;
+
+pub use live::LiveResponse;
+use live::{LiveItem, LiveSessions};
+
 const EXECUTION_BUFFER_CAPACITY: usize = 32;
+
+/// How many requests may queue on a live exchange's uplink, and how many events
+/// on its downlink before the session waits for the client to read.
+const LIVE_UPLINK_CAPACITY: usize = 32;
+const LIVE_DOWNLINK_CAPACITY: usize = 32;
+
+/// How many client messages may wait for an executor that reads its live input
+/// slowly; one more is declined as "not accepting input right now".
+const LIVE_INPUT_CAPACITY: usize = 16;
 
 /// How long a long-poll `GetTask` (`currentGeneration`) is held open when the
 /// task does not advance. The spec lets a server return earlier with the
@@ -52,6 +67,9 @@ struct ActiveExecution {
     /// one per execution: a cancel or a follow-up that arrives while no
     /// execution is running serialises on the same lock.
     writer: Arc<tokio::sync::Mutex<()>>,
+    /// Where live client messages go while the executor runs; set once, when
+    /// the executor accepts live input.
+    inputs: std::sync::OnceLock<tokio::sync::mpsc::Sender<ClientInput>>,
 }
 
 impl ActiveExecution {
@@ -69,6 +87,7 @@ impl ActiveExecution {
                 snapshot_task: task,
             }),
             writer,
+            inputs: std::sync::OnceLock::new(),
         })
     }
 
@@ -338,6 +357,16 @@ fn requested_protocol_version(params: &ServiceParams) -> String {
         .to_string()
 }
 
+/// Whether `version` (an `A2A-Version` value) is 1.1 or later within 1.x.
+fn is_at_least_1_1(version: &str) -> bool {
+    let mut parts = version.trim().split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = parts
+        .next()
+        .map_or(Some(0), |part| part.parse::<u32>().ok());
+    matches!((major, minor), (Some(1), Some(minor)) if minor >= 1)
+}
+
 /// Applies the response-trimming parameters shared by every operation that
 /// returns a task: the deprecated `historyLength` and its replacement
 /// `timelineLength`.
@@ -407,6 +436,13 @@ async fn send_push_notifications(
 
     let configs = push_config_store.list(task_id).await?;
     for config in configs {
+        // The same rule as for streams: an appended message is only sent to a
+        // receiver registered under 1.1 or later (no version means 1.0).
+        if matches!(event, StreamResponse::MessageUpdate(_))
+            && !is_at_least_1_1(config.protocol_version.as_deref().unwrap_or("1.0"))
+        {
+            continue;
+        }
         push_sender.send_push(&config, event.clone()).await?;
     }
 
@@ -550,7 +586,8 @@ fn apply_client_artifacts(
     task: &mut Task,
     req: &SendMessageRequest,
     new_task: bool,
-) -> Result<(), A2AError> {
+) -> Result<Vec<TaskArtifactUpdateEvent>, A2AError> {
+    let mut applied = Vec::with_capacity(req.artifact_updates.len());
     for update in &req.artifact_updates {
         let mut update = update.clone();
         if !new_task {
@@ -582,14 +619,15 @@ fn apply_client_artifacts(
         update.artifact.role = Some(Role::User);
         update.task_id = task.id.clone();
         update.context_id = task.context_id.clone();
-        merge_artifact(task, &mut update).map_err(|_| {
+        update.generation = merge_artifact(task, &mut update).map_err(|_| {
             A2AError::invalid_params(format!(
                 "cannot append to unknown artifact {}",
                 update.artifact.artifact_id
             ))
         })?;
+        applied.push(update);
     }
-    Ok(())
+    Ok(applied)
 }
 
 /// Records a follow-up client message in the task's timeline, then applies
@@ -604,7 +642,7 @@ fn record_client_input(task: &mut Task, req: &SendMessageRequest) -> Result<(), 
                 generation: task.generation,
             });
     }
-    apply_client_artifacts(task, req, false)
+    apply_client_artifacts(task, req, false).map(|_| ())
 }
 
 /// Where a cancellation stands while its executor's events are applied.
@@ -838,6 +876,7 @@ fn subscription_stream(
     snapshot_task: Option<Task>,
     min_sequence: u64,
     include_repeats: bool,
+    message_updates: bool,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
     Box::pin(futures::stream::unfold(
         SubscriptionState {
@@ -862,6 +901,16 @@ fn subscription_stream(
                 match state.receiver.recv().await {
                     Ok(event) if event.sequence <= state.min_sequence => continue,
                     Ok(event) if event.repeated && !include_repeats => {
+                        state.min_sequence = event.sequence;
+                        continue;
+                    }
+                    // A message appended to the task is a payload kind a 1.0
+                    // client does not know; only one that announced 1.1 or later
+                    // is sent it, and reconciles the generation gap otherwise.
+                    Ok(event)
+                        if !message_updates
+                            && matches!(&event.result, Ok(StreamResponse::MessageUpdate(_))) =>
+                    {
                         state.min_sequence = event.sequence;
                         continue;
                     }
@@ -1121,6 +1170,41 @@ pub trait RequestHandler: Send + Sync + 'static {
         params: &ServiceParams,
         req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError>;
+
+    /// `SendLiveMessage` over a transport with native duplex (gRPC): `uplink`
+    /// carries the client's requests and the returned stream the task's events,
+    /// for as long as the exchange lasts. A request that cannot even open the
+    /// exchange is an `Err`; one rejected later is a `StreamError` on the
+    /// stream, which stays open.
+    ///
+    /// Not supported unless the handler overrides it.
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        uplink: BoxStream<'static, StreamRequest>,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        let _ = (params, uplink);
+        Err(A2AError::unsupported_operation(
+            "SendLiveMessage is not supported",
+        ))
+    }
+
+    /// `SendLiveMessage` over a transport that has none (JSON-RPC, REST): each
+    /// call carries one request. The call that opens an exchange gets its events
+    /// back; a later call for the same task is input to that exchange and gets
+    /// only the task as it stands (see [`LiveResponse`]).
+    ///
+    /// Not supported unless the handler overrides it.
+    async fn send_live_request(
+        &self,
+        params: &ServiceParams,
+        request: StreamRequest,
+    ) -> Result<LiveResponse, A2AError> {
+        let _ = (params, request);
+        Err(A2AError::unsupported_operation(
+            "SendLiveMessage is not supported",
+        ))
+    }
 }
 
 /// Decides whether a request may proceed.
@@ -1144,6 +1228,9 @@ where
 
 /// Default implementation of [`RequestHandler`] that orchestrates
 /// task lifecycle management, storage, and executor dispatch.
+///
+/// Cheap to clone: everything it holds is shared.
+#[derive(Clone)]
 pub struct DefaultRequestHandler {
     executor: Arc<dyn crate::AgentExecutor>,
     task_store: Arc<dyn crate::TaskStore>,
@@ -1156,6 +1243,7 @@ pub struct DefaultRequestHandler {
     extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
     task_changed: Arc<Notify>,
     long_poll_timeout: Duration,
+    live: Arc<LiveSessions>,
 }
 
 /// Supplies the authenticated extended Agent Card (§12.4, §10.1).
@@ -1193,6 +1281,7 @@ impl DefaultRequestHandler {
             extended_agent_card: None,
             task_changed: Arc::new(Notify::new()),
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
+            live: Arc::new(LiveSessions::default()),
         }
     }
 
@@ -1894,6 +1983,15 @@ impl DefaultRequestHandler {
         let receiver = active.subscribe();
         drop(writer_guard);
 
+        // An executor that reads live input gets a channel for it; the sender
+        // stays with the execution so a live stream can reach it.
+        let inputs = if self.executor.accepts_live_input() {
+            let (sender, receiver) = tokio::sync::mpsc::channel(LIVE_INPUT_CAPACITY);
+            let _ = active.inputs.set(sender);
+            Some(receiver)
+        } else {
+            None
+        };
         let exec_ctx = crate::ExecutorContext {
             message: (!artifact_only).then_some(req.message),
             task_id: task_id.clone(),
@@ -1907,6 +2005,7 @@ impl DefaultRequestHandler {
             user: None,
             service_params: params.clone(),
             tenant: req.tenant,
+            inputs,
         };
 
         let runtime = ExecutionRuntime {
@@ -1990,7 +2089,7 @@ impl RequestHandler for DefaultRequestHandler {
         let task_id = task.id;
         // Unlike a client-facing stream this one keeps the executor's no-op
         // snapshots: the blocking send only needs to know the executor spoke.
-        let mut stream = subscription_stream(receiver, None, 0, true);
+        let mut stream = subscription_stream(receiver, None, 0, true, false);
         let mut last_event = None;
 
         while let Some(item) = stream.next().await {
@@ -2043,7 +2142,13 @@ impl RequestHandler for DefaultRequestHandler {
         self.require_streaming()?;
         let (task, receiver) = self.start_execution(params, req, false).await?;
         Ok(with_opening_task(
-            subscription_stream(receiver, None, 0, false),
+            subscription_stream(
+                receiver,
+                None,
+                0,
+                false,
+                is_at_least_1_1(&requested_protocol_version(params)),
+            ),
             task,
         ))
     }
@@ -2155,6 +2260,7 @@ impl RequestHandler for DefaultRequestHandler {
             user: None,
             service_params: params.clone(),
             tenant: req.tenant,
+            inputs: None,
         };
         // A store that advanced the generation recorded the transition itself.
         let recorded_by_store = task.generation > generation_before;
@@ -2223,6 +2329,7 @@ impl RequestHandler for DefaultRequestHandler {
                 snapshot_task,
                 sequence,
                 false,
+                is_at_least_1_1(&requested_protocol_version(params)),
             ));
         }
 
@@ -2239,6 +2346,25 @@ impl RequestHandler for DefaultRequestHandler {
             }
         }
         Err(A2AError::task_not_found(&req.id))
+    }
+
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        uplink: BoxStream<'static, StreamRequest>,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        let uplink = uplink
+            .map(|request| LiveItem { request, ack: None })
+            .boxed();
+        self.open_live(params, uplink, None).await
+    }
+
+    async fn send_live_request(
+        &self,
+        params: &ServiceParams,
+        request: StreamRequest,
+    ) -> Result<LiveResponse, A2AError> {
+        self.live_request(params, request).await
     }
 
     async fn create_push_config(
@@ -5504,7 +5630,7 @@ mod lag_coverage_tests {
             });
         }
 
-        let mut stream = subscription_stream(receiver, None, 0, true);
+        let mut stream = subscription_stream(receiver, None, 0, true, false);
         let item = stream.next().await.expect("lagged item");
 
         let error = item.expect_err("lag must surface as an error");
