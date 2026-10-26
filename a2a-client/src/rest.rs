@@ -212,10 +212,11 @@ impl RestTransport {
         &self,
         path: &str,
         params: &ServiceParams,
+        query: &[(String, String)],
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let resp = self
             .send(
-                self.build_request(reqwest::Method::GET, path, params)
+                self.build_request_with_query(reqwest::Method::GET, path, params, query)
                     .header("Accept", "text/event-stream"),
             )
             .await?;
@@ -297,6 +298,12 @@ impl Transport for RestTransport {
         if let Some(hl) = req.history_length {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
         }
+        if let Some(tl) = req.timeline_length {
+            query_parts.push(("timelineLength".to_string(), tl.to_string()));
+        }
+        if let Some(generation) = req.current_generation {
+            query_parts.push(("currentGeneration".to_string(), generation.to_string()));
+        }
         self.get_json(&path, params, &query_parts).await
     }
 
@@ -325,6 +332,9 @@ impl Transport for RestTransport {
         if let Some(hl) = req.history_length {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
         }
+        if let Some(tl) = req.timeline_length {
+            query_parts.push(("timelineLength".to_string(), tl.to_string()));
+        }
         if let Some(ref ts) = req.status_timestamp_after {
             query_parts.push(("statusTimestampAfter".to_string(), ts.to_rfc3339()));
         }
@@ -349,11 +359,22 @@ impl Transport for RestTransport {
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let canonical_path = format!("/tasks/{}:subscribe", req.id);
-        match self.get_streaming(&canonical_path, params).await {
+        let mut query_parts = Vec::new();
+        if let Some(generation) = req.last_seen_generation {
+            query_parts.push(("lastSeenGeneration".to_string(), generation.to_string()));
+        }
+        match self
+            .get_streaming(&canonical_path, params, &query_parts)
+            .await
+        {
             Ok(stream) => Ok(stream),
             Err(err) if should_retry_subscribe_with_legacy_path(&err) => {
-                self.get_streaming(&format!("/tasks/{}/subscribe", req.id), params)
-                    .await
+                self.get_streaming(
+                    &format!("/tasks/{}/subscribe", req.id),
+                    params,
+                    &query_parts,
+                )
+                .await
             }
             Err(err) => Err(err),
         }

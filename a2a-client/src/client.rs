@@ -31,6 +31,15 @@ impl<T: Transport> A2AClient<T> {
         }
     }
 
+    /// Signal `version` in the `A2A-Version` service parameter instead of the
+    /// SDK's own [`VERSION`]. A client talking to an agent that declares an
+    /// older minor version uses this to speak that version.
+    pub fn with_protocol_version(mut self, version: impl Into<String>) -> Self {
+        self.default_params
+            .insert(SVC_PARAM_VERSION.to_string(), vec![version.into()]);
+        self
+    }
+
     pub fn with_interceptors(mut self, interceptors: Vec<Arc<dyn CallInterceptor>>) -> Self {
         self.interceptors = interceptors;
         self
@@ -533,6 +542,19 @@ mod tests {
         let client = make_client();
         let params = client.params();
         assert!(params.contains_key(SVC_PARAM_VERSION));
+    }
+
+    #[test]
+    fn test_with_protocol_version_replaces_the_signaled_version() {
+        let client = make_client().with_protocol_version("1.0");
+        assert_eq!(
+            client.params().get(SVC_PARAM_VERSION),
+            Some(&vec!["1.0".to_string()])
+        );
+        assert_eq!(
+            make_client().params().get(SVC_PARAM_VERSION),
+            Some(&vec![VERSION.to_string()])
+        );
     }
 
     #[test]
