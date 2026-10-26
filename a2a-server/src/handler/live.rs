@@ -219,6 +219,9 @@ enum Delivery {
 
 /// Whether `error` is the refusal of a second execution for a task that is
 /// already running one.
+/// Why a message is declined when its turn has closed its input queue.
+const INPUT_CLOSED: &str = "the agent is no longer taking input";
+
 fn is_in_progress(error: &A2AError) -> bool {
     error.code == error_code::INVALID_REQUEST && error.message.contains("already in progress")
 }
@@ -423,7 +426,29 @@ impl DefaultRequestHandler {
             wants_message_updates,
             registration,
         };
-        tokio::spawn(session.run(opening, inner, seen_generation, uplink, out));
+        let (failed_out, handler, task_id, registration) = (
+            out.clone(),
+            self.clone(),
+            session.task_id.clone(),
+            session.registration.clone(),
+        );
+        tokio::spawn(async move {
+            let run = session.run(opening, inner, seen_generation, uplink, out);
+            if std::panic::AssertUnwindSafe(run)
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                // The session is gone: no call is routed to it any more, and
+                // the client is told its exchange failed instead of just ending.
+                if let Some(registration) = &registration {
+                    handler.live.unregister(&task_id, registration);
+                }
+                let _ = failed_out
+                    .send(Err(A2AError::internal("the live exchange failed")))
+                    .await;
+            }
+        });
         Ok(ReceiverStream::new(downlink).boxed())
     }
 
@@ -444,8 +469,17 @@ impl DefaultRequestHandler {
         // finish before the message can join it: each lap looks again.
         for _ in 0..3 {
             if let Some(task_id) = &task_id {
-                if let Some(delivery) = self.try_inject(params, &request, task_id).await? {
-                    return Ok(delivery);
+                match self.try_inject(params, &request, task_id).await {
+                    Ok(Some(delivery)) => return Ok(delivery),
+                    Ok(None) => {}
+                    // The turn is ending: once it has finished, the message
+                    // starts the next one.
+                    Err(Rejection::Declined(reason)) if reason == INPUT_CLOSED => {
+                        last_error = Some(A2AError::unsupported_operation(reason));
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    Err(rejection) => return Err(rejection),
                 }
             }
             match self.start_execution(params, request.clone(), false).await {
@@ -462,9 +496,13 @@ impl DefaultRequestHandler {
                 Err(error) => return Err(Rejection::Failed(error)),
             }
         }
-        Err(Rejection::Failed(last_error.unwrap_or_else(|| {
-            A2AError::internal("could not deliver the message")
-        })))
+        Err(match last_error {
+            Some(error) if error.code == error_code::UNSUPPORTED_OPERATION => {
+                Rejection::Declined(error.message)
+            }
+            Some(error) => Rejection::Failed(error),
+            None => Rejection::Failed(A2AError::internal("could not deliver the message")),
+        })
     }
 
     /// Appends the message to the task under the writer lock and passes it to
@@ -539,9 +577,7 @@ impl DefaultRequestHandler {
                 InputRefusal::Full => {
                     Rejection::Declined("the agent is busy with earlier input".to_string())
                 }
-                InputRefusal::Closed => {
-                    Rejection::Declined("the agent is no longer taking input".to_string())
-                }
+                InputRefusal::Closed => Rejection::Declined(INPUT_CLOSED.to_string()),
             })?)
         };
 
@@ -976,6 +1012,11 @@ impl LiveRun {
             Delivery::Started {
                 receiver, recorded, ..
             } => {
+                // The execution that ended has published all it will; what
+                // this stream has not forwarded yet goes out before it moves on.
+                if !self.flush(inner, last_generation, out).await {
+                    return Ok(());
+                }
                 *inner = Some(subscription_stream(
                     receiver,
                     None,
