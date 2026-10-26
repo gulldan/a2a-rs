@@ -111,6 +111,7 @@ version = "0.5.3"
 dependencies = [
  "a2a-lf",
  "a2a-pb",
+ "async-stream",
  "async-trait",
  "axum",
  "axum-server",

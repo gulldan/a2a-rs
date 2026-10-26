@@ -79,7 +79,24 @@ impl TaskStore for InMemoryTaskStore {
         }
         entry.version += 1;
         entry.task.status.state = TaskState::Canceled;
+        // What the agent said while working does not describe the cancellation.
+        entry.task.status.message = None;
         entry.task.status.timestamp = Some(chrono::Utc::now());
+        // The state change and its generation land in one write: no reader
+        // sees the task canceled at the generation it had while working. The
+        // handler announces the transition as the one status event of this
+        // generation.
+        entry.task.generation += 1;
+        let status = entry.task.status.clone();
+        let generation = entry.task.generation;
+        entry
+            .task
+            .timeline
+            .get_or_insert_with(Vec::new)
+            .push(TimelineEntry {
+                content: TimelineContent::Status(status),
+                generation,
+            });
         Ok(entry.task.clone())
     }
 

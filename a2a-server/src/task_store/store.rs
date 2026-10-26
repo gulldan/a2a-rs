@@ -44,6 +44,13 @@ pub trait TaskStore: Send + Sync + 'static {
     /// `TASK_NOT_CANCELABLE` if the task is already terminal,
     /// `TASK_NOT_FOUND` if it does not exist.
     ///
+    /// A store that tracks generations should advance the generation and
+    /// append the `CANCELED` status to the timeline in the same write, so no
+    /// reader sees the task canceled at its old generation. `DefaultRequestHandler`
+    /// then announces that entry as the one status event of the new generation.
+    /// A store that does not (the generation comes back unchanged) is
+    /// recorded by the handler instead, a moment later.
+    ///
     /// Deliberately has no default implementation. A default could only read
     /// and then write, which is the check-then-act race this method exists to
     /// close, and an implementor who did not notice would inherit it silently.
