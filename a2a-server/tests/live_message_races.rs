@@ -215,6 +215,31 @@ fn applied(task: &Task, t: &str) -> usize {
         .count()
 }
 
+/// Waits until no execution holds the task: a subscription then finds it idle
+/// (not found), where a running one would be followed.
+async fn wait_until_released(h: &DefaultRequestHandler, id: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let subscription = h
+                .subscribe_to_task(
+                    &ServiceParams::new(),
+                    SubscribeToTaskRequest {
+                        id: id.into(),
+                        tenant: None,
+                        last_seen_generation: None,
+                    },
+                )
+                .await;
+            if matches!(&subscription, Err(e) if e.code == error_code::TASK_NOT_FOUND) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the execution is released");
+}
+
 async fn get(h: &DefaultRequestHandler, id: &str) -> Task {
     h.get_task(
         &ServiceParams::new(),
@@ -257,14 +282,13 @@ async fn p1_starting_a_turn_does_not_drop_the_previous_turns_buffered_events() {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_until_released(&h, &task.id).await;
         // A loaded machine can make the session lag behind the burst, which ends
         // the exchange before the next message; that round proves nothing.
         if up.send(send("ask", Some(&task.id))).await.is_err() {
             skipped += 1;
             continue;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let mut seen = Vec::new();
         let mut last_gen = task.generation;
         let mut gap = false;
@@ -309,8 +333,7 @@ async fn p2_panic_after_saving_is_not_delivered_twice() {
         other => panic!("{other:?}"),
     };
     next(&mut down).await; // INPUT_REQUIRED
-    // let the execution finish
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until_released(&h, &task_id).await;
     store.panic_after_update.store(true, Ordering::SeqCst);
     let reply = tokio::time::timeout(
         Duration::from_secs(5),

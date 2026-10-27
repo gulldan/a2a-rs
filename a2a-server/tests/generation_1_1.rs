@@ -1174,6 +1174,8 @@ async fn a_follow_up_is_visible_while_its_turn_is_still_running() {
 struct SlowGetStore {
     inner: Arc<InMemoryTaskStore>,
     slow: Arc<std::sync::atomic::AtomicBool>,
+    /// Signalled when the slow `get` has begun.
+    entered: Arc<Notify>,
 }
 
 impl SlowGetStore {
@@ -1181,7 +1183,16 @@ impl SlowGetStore {
         SlowGetStore {
             inner: Arc::new(InMemoryTaskStore::new()),
             slow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            entered: Arc::new(Notify::new()),
         }
+    }
+
+    /// Waits until the slow `get` has begun, that is, until a request is held
+    /// between reading the task and acting on it.
+    async fn slow_get_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
+            .await
+            .expect("a request reached the slow read");
     }
 
     fn slow_next_get(&self) {
@@ -1200,6 +1211,7 @@ impl a2a_server::TaskStore for SlowGetStore {
     async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
         if self.slow.swap(false, std::sync::atomic::Ordering::SeqCst) {
             let read = self.inner.get(task_id).await;
+            self.entered.notify_one();
             tokio::time::sleep(Duration::from_millis(200)).await;
             return read;
         }
@@ -1503,7 +1515,7 @@ async fn a_cancel_during_a_follow_ups_preparation_is_ordered_after_it() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    store.slow_get_entered().await;
     let canceled = handler
         .cancel_task(&params, cancel(&first.id))
         .await
@@ -1661,7 +1673,7 @@ async fn subscribing_while_a_follow_up_is_prepared_opens_with_the_task() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    store.slow_get_entered().await;
 
     let stream = handler
         .subscribe_to_task(
@@ -1721,7 +1733,7 @@ async fn subscribing_while_a_follow_up_fails_never_yields_an_empty_stream() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    store.slow_get_entered().await;
 
     let subscribed = handler
         .subscribe_to_task(
@@ -1887,7 +1899,7 @@ async fn a_cancel_and_a_follow_up_on_an_idle_task_are_ordered() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    store.slow_get_entered().await;
     // ...so a follow-up arriving meanwhile has to wait and then finds the
     // task finished.
     let follow_up = handler

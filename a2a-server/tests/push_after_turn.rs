@@ -203,9 +203,18 @@ async fn pushes_stay_in_order_across_turns() {
             .unwrap()
             .unwrap()
             .unwrap();
+        // A turn that began and ended while the exchange was idle reaches it as
+        // the task's snapshot, not as events.
+        let asks_for_input = match &e {
+            StreamResponse::Task(t) => {
+                task_id = t.id.clone();
+                t.status.state == TaskState::InputRequired
+            }
+            StreamResponse::StatusUpdate(u) => u.status.state == TaskState::InputRequired,
+            _ => false,
+        };
         match &e {
-            StreamResponse::Task(t) => task_id = t.id.clone(),
-            StreamResponse::StatusUpdate(u) if u.status.state == TaskState::InputRequired => {
+            _ if asks_for_input => {
                 n += 1;
                 if n == 1 {
                     up.send(StreamRequest {
@@ -223,8 +232,18 @@ async fn pushes_stay_in_order_across_turns() {
             _ => {}
         }
     }
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let seen = seen.lock().unwrap().clone();
+    // Deliveries are made one at a time: wait for turn two's, not for a while.
+    let seen = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let seen = seen.lock().unwrap().clone();
+            if seen.iter().any(|s| s.contains("reply-to-two")) {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn two's webhook is called");
     let one = seen.iter().position(|s| s.contains("reply-to-one"));
     let two = seen.iter().position(|s| s.contains("reply-to-two"));
     assert!(

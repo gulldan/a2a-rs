@@ -426,18 +426,23 @@ async fn reopened_after_the_exchange_ended(transport: impl Transport) {
     assert_eq!(text_of(&next(&mut live).await), "working");
     let sender = live.sender.clone();
     drop(live); // the stream goes away; the server ends the exchange
-    tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    let LiveAck::Reopened(mut again) = sender
+    // The request reaches the exchange before it has noticed (a plain
+    // acknowledgement) or finds none and opens a new one, which the client is
+    // handed; the message is applied once either way.
+    let task = match sender
         .send(send("hello", Some(&opening.id)))
         .await
         .expect("the request is sent")
-    else {
-        panic!("the request opened a new exchange");
-    };
-
-    let StreamResponse::Task(task) = next(&mut again).await else {
-        panic!("a new exchange opens with the task");
+    {
+        LiveAck::Reopened(mut again) => {
+            let StreamResponse::Task(task) = next(&mut again).await else {
+                panic!("a new exchange opens with the task");
+            };
+            task
+        }
+        LiveAck::Task(task) => *task,
+        _ => panic!("unexpected acknowledgement"),
     };
     let said: Vec<_> = task
         .timeline

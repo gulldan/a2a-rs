@@ -562,7 +562,14 @@ async fn a_task_the_executor_has_not_created_yet_is_not_found() {
         let handler = handler.clone();
         tokio::spawn(async move { handler.send_message(&params(), send("slow-reply")).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The executor is running (it recorded the id) and has yet to reply.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ids.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the executor started");
     let id = ids.lock().unwrap()[0].clone();
     for result in [
         handler
