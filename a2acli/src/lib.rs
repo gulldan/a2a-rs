@@ -5663,8 +5663,8 @@ mod tests {
     }
 
     /// Absent a flag, negotiate down to the highest version both sides
-    /// declare — `supported` is a parameter precisely so this branch is
-    /// exercisable while this build's own VERSION is still 1.0.
+    /// declare — `supported` is a parameter so this branch is exercisable
+    /// whatever this build's own VERSION is.
     #[test]
     fn test_negotiate_a2a_version_takes_the_highest_shared_1x() {
         // Agent declares less than we support: follow it down, and say so.

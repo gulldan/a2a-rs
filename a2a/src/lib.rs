@@ -18,10 +18,7 @@ pub use jsonrpc::*;
 pub use types::*;
 
 /// The A2A protocol version this SDK advertises and signals.
-///
-/// The 1.1 task bookkeeping (generation, timeline) is implemented, but 1.1 is
-/// not declared until `SendLiveMessage` is too.
-pub const VERSION: &str = "1.0";
+pub const VERSION: &str = "1.1";
 
 /// Service parameter key for the A2A protocol version.
 pub const SVC_PARAM_VERSION: &str = "A2A-Version";

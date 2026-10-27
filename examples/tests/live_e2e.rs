@@ -537,7 +537,11 @@ async fn the_client_opens_an_exchange_through_its_interceptors_and_applies_the_t
         })
         .await
         .expect("the request is sent");
-    // The client signals the SDK's own version, 1.0 for now, so the message it
-    // sent is not announced to it: the next thing it hears is the outcome.
+    // The client signals the SDK's own version, 1.1, so the message it sent is
+    // announced to it before the outcome.
+    assert!(matches!(
+        next(&mut live).await,
+        StreamResponse::MessageUpdate(_)
+    ));
     assert_eq!(text_of(&next(&mut live).await), "done");
 }
