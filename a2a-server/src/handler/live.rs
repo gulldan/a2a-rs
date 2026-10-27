@@ -25,6 +25,15 @@
 //!   (`EXECUTION_BUFFER_CAPACITY` events) faster than a session drains them
 //!   ends that exchange with an error, as it does a streaming subscription.
 //! - Without replay, `lastSeenGeneration` resumes from a snapshot.
+//! - A push receiver that, before it answers a push, calls back into the task
+//!   (a follow-up message, a cancel) waits until the push times out: the
+//!   task's pushes are delivered one at a time, in order, and the follow-up's
+//!   first push queues behind the one still unanswered.
+//! - With `fail_on_error`, a failure to push the last event of a turn that
+//!   ends without a terminal state is logged, not reported to the stream.
+//! - Pushes of events published by different callers within one turn (a live
+//!   input and the executor's reply) are ordered as the callers reach the
+//!   push lock, which can differ from the order they were published in.
 //! - A turn is closed ahead of the push of its last event only when the
 //!   executor's stream ends right after that event; an executor that awaits
 //!   something after its last yield keeps the input queue open for the push.

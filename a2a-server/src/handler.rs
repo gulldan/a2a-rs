@@ -1101,6 +1101,8 @@ async fn drive_execution(
                 // webhook. The push goes on in the background, ahead of the
                 // next turn's (the task's push lock is taken before the release).
                 if !is_terminal_event(&event)
+                    && runtime.push_config_store.is_some()
+                    && runtime.push_sender.is_some()
                     && matches!(
                         std::pin::Pin::new(&mut stream).peek().now_or_never(),
                         Some(None)

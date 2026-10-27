@@ -224,7 +224,10 @@ async fn pushes_stay_in_order_across_turns() {
     let seen = seen.lock().unwrap().clone();
     let one = seen.iter().position(|s| s.contains("reply-to-one"));
     let two = seen.iter().position(|s| s.contains("reply-to-two"));
-    assert!(one < two, "turn 2 pushed before turn 1: {seen:?}");
+    assert!(
+        one.is_some() && one < two,
+        "turn 2 pushed before turn 1: {seen:?}"
+    );
 }
 
 /// The streams of a turn that ends without a terminal event end with it, not
