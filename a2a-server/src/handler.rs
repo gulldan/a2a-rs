@@ -461,6 +461,20 @@ fn should_interrupt_non_streaming(
     }
 }
 
+/// The error for a request on a unary or streaming call that could not be
+/// carried out. A message the running agent will not take is reported as the
+/// task being busy, which is what these calls said before they could join a
+/// running turn.
+fn unary_refusal(rejection: live::Rejection, request: &SendMessageRequest) -> A2AError {
+    match rejection {
+        live::Rejection::Declined(reason) => A2AError::invalid_request(format!(
+            "task execution is already in progress: {} ({reason})",
+            request_task_id(request).unwrap_or_default()
+        )),
+        live::Rejection::Failed(error) => error,
+    }
+}
+
 /// Pushes `event` once the pushes of the task's earlier events are done.
 async fn send_push_notifications(
     manager: &ExecutionManager,
@@ -474,6 +488,38 @@ async fn send_push_notifications(
     }
     let _ordered = manager.push_lock_for(task_id).lock_owned().await;
     deliver_push_notifications(task_id, push_config_store, push_sender, event).await
+}
+
+/// Pushes `events` in the background, after the pushes already queued for the
+/// task. The place in line is taken before this returns, so pushes made after
+/// it come after these.
+async fn spawn_push_notifications(
+    manager: &ExecutionManager,
+    task_id: &str,
+    store: Option<Arc<dyn crate::PushConfigStore>>,
+    sender: Option<Arc<crate::HttpPushSender>>,
+    events: Vec<StreamResponse>,
+) {
+    if store.is_none() || sender.is_none() || events.is_empty() {
+        return;
+    }
+    let mut ordered = Box::pin(manager.push_lock_for(task_id).lock_owned());
+    let held = futures::poll!(ordered.as_mut());
+    let task_id = task_id.to_string();
+    tokio::spawn(async move {
+        let _ordered = match held {
+            std::task::Poll::Ready(guard) => guard,
+            std::task::Poll::Pending => ordered.await,
+        };
+        for event in &events {
+            if let Err(error) =
+                deliver_push_notifications(&task_id, store.as_deref(), sender.as_deref(), event)
+                    .await
+            {
+                tracing::warn!(task_id = %task_id, %error, "could not push a live input");
+            }
+        }
+    });
 }
 
 /// [`send_push_notifications`] for a caller that holds the task's push lock.
@@ -2304,11 +2350,24 @@ impl RequestHandler for DefaultRequestHandler {
             .configuration
             .as_ref()
             .and_then(|configuration| configuration.timeline_length);
-        let (task, receiver, _) = self.start_execution(params, req.clone(), true).await?;
-        let task_id = task.id;
+        let (task_id, receiver, min_sequence) = match self
+            .live_deliver(params, req.clone(), true)
+            .await
+            .map_err(|rejection| unary_refusal(rejection, &req))?
+        {
+            live::Delivery::Started { task, receiver, .. } => (task.id, receiver, 0),
+            // The task is running and its executor took the message: the call
+            // waits for the turn it joined, as it would for one it started.
+            live::Delivery::Injected {
+                task,
+                receiver,
+                sequence_before,
+                ..
+            } => (task.id, receiver, sequence_before),
+        };
         // Unlike a client-facing stream this one keeps the executor's no-op
         // snapshots: the blocking send only needs to know the executor spoke.
-        let mut stream = subscription_stream(receiver, None, 0, true, false, false);
+        let mut stream = subscription_stream(receiver, None, min_sequence, true, false, false);
         let mut last_event = None;
 
         while let Some(item) = stream.next().await {
@@ -2359,12 +2418,24 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.authorize(params, request_task_id(&req).as_deref())?;
         self.require_streaming()?;
-        let (task, receiver, _) = self.start_execution(params, req, false).await?;
+        let (task, receiver, min_sequence) = match self
+            .live_deliver(params, req.clone(), false)
+            .await
+            .map_err(|rejection| unary_refusal(rejection, &req))?
+        {
+            live::Delivery::Started { task, receiver, .. } => (task, receiver, 0),
+            live::Delivery::Injected {
+                task,
+                receiver,
+                sequence_before,
+                ..
+            } => (task, receiver, sequence_before),
+        };
         Ok(with_opening_task(
             subscription_stream(
                 receiver,
                 None,
-                0,
+                min_sequence,
                 false,
                 is_at_least_1_1(&requested_protocol_version(params)),
                 false,

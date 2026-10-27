@@ -1261,12 +1261,13 @@ async fn racing_follow_ups_with_the_same_expected_generation_do_not_both_win() {
         1,
         "exactly one wins: {slow:?} / {fast:?}"
     );
-    // The reservation turns the loser away; the guard on the generation is
-    // what refuses a request that gets past it (see the stale-generation test).
+    // The reservation turns the loser away as busy, or, once it reaches the
+    // task the winner changed, the guard on the generation refuses it.
     let loser = if slow.is_ok() { &fast } else { &slow };
-    assert_eq!(
-        loser.as_ref().unwrap_err().code,
-        error_code::INVALID_REQUEST
+    let code = loser.as_ref().unwrap_err().code;
+    assert!(
+        code == error_code::INVALID_REQUEST || code == error_code::TASK_GENERATION_MISMATCH,
+        "unexpected error {code}"
     );
     let stored = handler.get_task(&params, get(&first.id)).await.unwrap();
     let from_clients: Vec<_> = timeline_of(&stored)

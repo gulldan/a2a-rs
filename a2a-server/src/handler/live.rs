@@ -170,7 +170,7 @@ pub enum LiveResponse {
 }
 
 /// Why a live request was not carried out.
-enum Rejection {
+pub(super) enum Rejection {
     /// The agent is not taking input now (not accepting it while it works, or
     /// its buffer is full). Not an error of the request: the client may retry.
     Declined(String),
@@ -185,7 +185,7 @@ impl From<A2AError> for Rejection {
 
 impl Rejection {
     /// The error to give a caller that is not on a stream yet.
-    fn into_error(self) -> A2AError {
+    pub(super) fn into_error(self) -> A2AError {
         match self {
             Rejection::Declined(reason) => A2AError::unsupported_operation(reason),
             Rejection::Failed(error) => error,
@@ -224,7 +224,7 @@ fn stream_error_code(error: &A2AError) -> String {
 }
 
 /// A message that reached a task, and what the session needs to carry on.
-enum Delivery {
+pub(super) enum Delivery {
     /// The message started a new turn.
     Started {
         task: Task,
@@ -378,7 +378,7 @@ impl DefaultRequestHandler {
             StreamRequestPayload::SendMessage(request) => {
                 self.authorize(params, request_task_id(&request).as_deref())?;
                 match self
-                    .live_deliver(params, request)
+                    .live_deliver(params, request, false)
                     .await
                     .map_err(Rejection::into_error)?
                 {
@@ -481,10 +481,11 @@ impl DefaultRequestHandler {
 
     /// Hands a message to a task: into the execution that is running, or as the
     /// start of a new turn.
-    async fn live_deliver(
+    pub(super) async fn live_deliver(
         &self,
         params: &ServiceParams,
         request: SendMessageRequest,
+        blocking: bool,
     ) -> Result<Delivery, Rejection> {
         self.validate_artifact_updates(&request)?;
         if !is_artifact_only(&request) {
@@ -509,7 +510,10 @@ impl DefaultRequestHandler {
                     Err(rejection) => return Err(rejection),
                 }
             }
-            match self.start_execution(params, request.clone(), false).await {
+            match self
+                .start_execution(params, request.clone(), blocking)
+                .await
+            {
                 Ok((task, receiver, recorded)) => {
                     return Ok(Delivery::Started {
                         task,
@@ -661,19 +665,16 @@ impl DefaultRequestHandler {
         drop(writer);
         self.task_changed.notify_waiters();
 
-        for event in &events {
-            if let Err(error) = send_push_notifications(
-                &self.execution_manager,
-                task_id,
-                self.push_config_store.as_deref(),
-                self.push_sender.as_deref(),
-                event,
-            )
-            .await
-            {
-                tracing::warn!(task_id, %error, "could not push a live input");
-            }
-        }
+        // The webhooks are called in the background, in order, so a slow
+        // receiver does not hold up the session that took the message.
+        spawn_push_notifications(
+            &self.execution_manager,
+            task_id,
+            self.push_config_store.clone(),
+            self.push_sender.clone(),
+            events,
+        )
+        .await;
         Ok(Some(Delivery::Injected {
             task,
             receiver,
@@ -1036,7 +1037,7 @@ impl LiveRun {
         self.handler
             .authorize(params, Some(&self.task_id))
             .map_err(Rejection::Failed)?;
-        match self.handler.live_deliver(params, request).await? {
+        match self.handler.live_deliver(params, request, false).await? {
             Delivery::Started {
                 receiver, recorded, ..
             } => {

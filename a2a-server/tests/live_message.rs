@@ -1618,3 +1618,129 @@ async fn a_panic_while_handling_a_call_never_loses_or_hangs_the_calls_queued_beh
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// SendMessage and SendStreamingMessage to a task that is working
+// ---------------------------------------------------------------------------
+
+fn message_request(text: &str, task_id: &str) -> SendMessageRequest {
+    match send(text, Some(task_id)).payload {
+        StreamRequestPayload::SendMessage(request) => request,
+        _ => unreachable!(),
+    }
+}
+
+/// Starts a task that waits for input, holding the stream that started it.
+async fn working_task(handler: &DefaultRequestHandler, p: &ServiceParams) -> (String, Downlink) {
+    let mut stream = match send("start", None).payload {
+        StreamRequestPayload::SendMessage(request) => {
+            handler.send_streaming_message(p, request).await.unwrap()
+        }
+        _ => unreachable!(),
+    };
+    let task_id = task_of(next(&mut stream).await).id;
+    assert_eq!(state_text(&next(&mut stream).await).1, "working");
+    (task_id, stream)
+}
+
+#[tokio::test]
+async fn a_streaming_message_to_a_working_task_reaches_the_agent() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (task_id, mut first) = working_task(&handler, &p).await;
+
+    let mut second = handler
+        .send_streaming_message(&p, message_request("hello", &task_id))
+        .await
+        .unwrap();
+    assert_eq!(task_of(next(&mut second).await).id, task_id);
+    assert!(matches!(
+        next(&mut second).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+    assert_eq!(state_text(&next(&mut second).await).1, "got: hello");
+    // The stream that started the turn hears it too.
+    assert!(matches!(
+        next(&mut first).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_blocking_message_to_a_working_task_waits_for_the_turn_it_joined() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (task_id, _first) = working_task(&handler, &p).await;
+
+    let call = {
+        let handler = handler.clone();
+        let p = p.clone();
+        let request = message_request("finish", &task_id);
+        tokio::spawn(async move { handler.send_message(&p, request).await })
+    };
+    let response = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the call returns when the turn ends")
+        .unwrap()
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(task.status.state, TaskState::Completed);
+    assert_eq!(applied(&task, "finish"), 1);
+}
+
+#[tokio::test]
+async fn a_message_to_a_working_task_can_return_at_once() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (task_id, _first) = working_task(&handler, &p).await;
+
+    let mut request = message_request("hello", &task_id);
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: None,
+        history_length: None,
+        timeline_length: None,
+        return_immediately: Some(true),
+        if_generation_match: None,
+    });
+    let response = tokio::time::timeout(Duration::from_secs(5), handler.send_message(&p, request))
+        .await
+        .expect("returns at once")
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(task.status.state, TaskState::Working);
+    assert_eq!(applied(&task, "hello"), 1);
+}
+
+#[tokio::test]
+async fn an_agent_that_takes_no_input_leaves_a_working_task_busy_for_unary_calls() {
+    let (handler, _) = handler(false);
+    let p = params("1.1");
+    let (task_id, _first) = working_task(&handler, &p).await;
+
+    let error = handler
+        .send_message(&p, message_request("hello", &task_id))
+        .await
+        .expect_err("the agent does not take input while it works");
+    assert_eq!(error.code, error_code::INVALID_REQUEST);
+    assert!(error.message.contains("already in progress"), "{error:?}");
+    // Nothing was recorded.
+    let stored = handler
+        .get_task(
+            &p,
+            GetTaskRequest {
+                id: task_id,
+                history_length: None,
+                tenant: None,
+                timeline_length: None,
+                current_generation: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied(&stored, "hello"), 0);
+}
