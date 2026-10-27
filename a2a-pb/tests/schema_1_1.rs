@@ -402,3 +402,54 @@ fn native_serde_skips_unknown_timeline_entries_and_null_generations() {
     );
     assert_eq!(timeline[1].generation, 3);
 }
+
+#[test]
+fn an_artifact_only_request_is_a_fixed_point_of_the_json_conversion() {
+    let update = event::TaskArtifactUpdateEvent {
+        task_id: "t1".into(),
+        context_id: String::new(),
+        artifact: Artifact {
+            artifact_id: "a1".into(),
+            name: None,
+            description: None,
+            parts: vec![],
+            metadata: None,
+            extensions: None,
+            start_generation: None,
+            end_generation: None,
+            role: None,
+        },
+        append: None,
+        last_chunk: None,
+        metadata: None,
+        generation: 0,
+    };
+    let mut empty = Message::new(Role::Unspecified, vec![]);
+    empty.message_id = String::new();
+    let mut variants = vec![empty.clone()];
+    for role in [Role::User, Role::Agent] {
+        let mut m = empty.clone();
+        m.role = role;
+        variants.push(m);
+    }
+    let mut m = empty.clone();
+    m.reference_task_ids = Some(vec![String::new()]);
+    variants.push(m);
+    let mut m = empty.clone();
+    m.extensions = Some(vec!["x".into()]);
+    variants.push(m);
+    for message in variants {
+        let request = SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: Some("t".into()),
+            artifact_updates: vec![update.clone()],
+        };
+        let once: SendMessageRequest =
+            protojson_conv::from_value(protojson_conv::to_value(&request).unwrap()).unwrap();
+        let twice: SendMessageRequest =
+            protojson_conv::from_value(protojson_conv::to_value(&once).unwrap()).unwrap();
+        assert_eq!(once, twice, "{request:?}");
+    }
+}

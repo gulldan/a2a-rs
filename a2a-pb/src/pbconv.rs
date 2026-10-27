@@ -526,14 +526,19 @@ pub fn from_proto_send_message_configuration(
 // ---------------------------------------------------------------------------
 
 /// A request that carries only `artifactUpdates` has no message on the wire;
-/// natively that is a message with no id and no role.
+/// natively that is a message with nothing in it: no id, no role, no parts and
+/// no other field. A message with anything set is sent, or that would be lost.
 fn is_absent_message(r: &SendMessageRequest) -> bool {
+    let m = &r.message;
     !r.artifact_updates.is_empty()
-        && r.message.role == Role::Unspecified
-        && r.message.message_id.is_empty()
-        && r.message.parts.is_empty()
-        && r.message.task_id.is_none()
-        && r.message.context_id.is_none()
+        && m.role == Role::Unspecified
+        && m.message_id.is_empty()
+        && m.parts.is_empty()
+        && m.task_id.is_none()
+        && m.context_id.is_none()
+        && m.metadata.is_none()
+        && m.extensions.is_none()
+        && m.reference_task_ids.is_none()
 }
 
 pub fn to_proto_send_message_request(r: &SendMessageRequest) -> proto::SendMessageRequest {
@@ -1834,12 +1839,25 @@ mod tests {
         let back = from_proto_send_message_request(&to_proto_send_message_request(&request));
         assert_eq!(back, request);
 
-        // An empty message that does have a role is a message, and keeps it.
+        // An empty message that has anything set is a message, and keeps it.
+        let mut variants = Vec::new();
         for role in [Role::User, Role::Agent] {
             let mut with_role = request.clone();
             with_role.message.role = role;
-            let back = from_proto_send_message_request(&to_proto_send_message_request(&with_role));
-            assert_eq!(back, with_role);
+            variants.push(with_role);
+        }
+        let mut with_references = request.clone();
+        with_references.message.reference_task_ids = Some(vec![String::new()]);
+        variants.push(with_references);
+        let mut with_extensions = request.clone();
+        with_extensions.message.extensions = Some(vec!["x".into()]);
+        variants.push(with_extensions);
+        let mut with_metadata = request.clone();
+        with_metadata.message.metadata = Some(HashMap::new());
+        variants.push(with_metadata);
+        for variant in variants {
+            let back = from_proto_send_message_request(&to_proto_send_message_request(&variant));
+            assert_eq!(back, variant);
         }
     }
 
