@@ -209,9 +209,6 @@ impl Rejection {
     }
 }
 
-/// Why a message is declined when its turn has closed its input queue.
-const INPUT_CLOSED: &str = "the agent is no longer taking input";
-
 fn stream_error_code(error: &A2AError) -> String {
     match error.code {
         error_code::INVALID_PARAMS
@@ -602,7 +599,11 @@ impl DefaultRequestHandler {
                 InputRefusal::Full => {
                     Rejection::Declined("the agent is busy with earlier input".to_string())
                 }
-                InputRefusal::Closed => Rejection::Declined(INPUT_CLOSED.to_string()),
+                // The queue is closed only together with the execution being
+                // deregistered, under the writer held here.
+                InputRefusal::Closed => Rejection::Failed(A2AError::internal(
+                    "the input queue of a registered execution is closed",
+                )),
             })?)
         };
 

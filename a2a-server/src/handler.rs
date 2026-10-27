@@ -1230,7 +1230,12 @@ async fn drive_execution(
                                 Some(published)
                             }
                             Err(error) => {
-                                reject_unread_inputs_locked(&active, &task_id).await;
+                                release_execution_locked(
+                                    &runtime.execution_manager,
+                                    &active,
+                                    &task_id,
+                                )
+                                .await;
                                 active.publish(Err(&error), None).await;
                                 None
                             }
@@ -1304,7 +1309,7 @@ async fn drive_execution(
                 )
                 .await
                 {
-                    fail_execution(&active, &task_id, &error).await;
+                    fail_execution(&runtime.execution_manager, &active, &task_id, &error).await;
                     break;
                 }
                 if is_terminal_event(&event) {
@@ -1312,12 +1317,7 @@ async fn drive_execution(
                 }
             }
             Err(error) => {
-                // An executor that fails before it has said anything created
-                // no task.
-                active
-                    .uncreated
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                fail_execution(&active, &task_id, &error).await;
+                fail_execution(&runtime.execution_manager, &active, &task_id, &error).await;
                 break;
             }
         }
@@ -1326,21 +1326,23 @@ async fn drive_execution(
     if !finished {
         // An executor that ended without saying anything still has a task: the
         // one the request prepared.
-        if active
-            .uncreated
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             let _writer = active.writer.lock().await;
-            if let Some(task) = active.snapshot().await {
-                match save_task_with(runtime.task_store.as_ref(), task, true).await {
-                    Ok(_) => save_pending_push_config(&active, &runtime).await,
-                    Err(error) => {
-                        tracing::warn!(task_id = %task_id, %error, "could not create the task");
+            if active
+                .uncreated
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(task) = active.snapshot().await {
+                    match save_task_with(runtime.task_store.as_ref(), task, true).await {
+                        Ok(_) => save_pending_push_config(&active, &runtime).await,
+                        Err(error) => {
+                            tracing::warn!(task_id = %task_id, %error, "could not create the task");
+                        }
                     }
                 }
             }
+            release_execution_locked(&runtime.execution_manager, &active, &task_id).await;
         }
-        release_execution(&runtime.execution_manager, &active, &task_id).await;
         runtime.task_changed.notify_waiters();
     }
 }
@@ -1356,6 +1358,17 @@ async fn release_execution(
     task_id: &str,
 ) {
     let _writer = active.writer.lock().await;
+    release_execution_locked(manager, active, task_id).await;
+}
+
+/// [`release_execution`] for a caller that already holds the task's writer.
+/// Every place that closes the queue while the task goes on does so through
+/// this, so a closed queue is never found on a registered execution.
+async fn release_execution_locked(
+    manager: &ExecutionManager,
+    active: &Arc<ActiveExecution>,
+    task_id: &str,
+) {
     reject_unread_inputs_locked(active, task_id).await;
     manager.finish(task_id, active).await;
 }
@@ -1412,9 +1425,18 @@ async fn reject_unread_inputs_locked(active: &ActiveExecution, task_id: &str) {
 
 /// Ends an execution with `error`: what the executor never read is answered
 /// first, then the error reaches the subscribers (which it ends).
-async fn fail_execution(active: &ActiveExecution, task_id: &str, error: &A2AError) {
+async fn fail_execution(
+    manager: &ExecutionManager,
+    active: &Arc<ActiveExecution>,
+    task_id: &str,
+    error: &A2AError,
+) {
     let _writer = active.writer.lock().await;
-    reject_unread_inputs_locked(active, task_id).await;
+    // An executor that fails before it has said anything created no task.
+    active
+        .uncreated
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    release_execution_locked(manager, active, task_id).await;
     active.publish(Err(error), None).await;
 }
 
@@ -1461,7 +1483,15 @@ async fn drive_execution_guarded(
         // A task the executor never created, or answered with a message alone,
         // stays uncreated: the panic is reported on the streams, and there is
         // no task to fail.
-        if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
+        let registered = manager
+            .get(&task_id)
+            .await
+            .is_some_and(|current| Arc::ptr_eq(&current, &active));
+        if !registered {
+            // The execution was released before the panic (it came from
+            // dropping the executor's stream): a later turn may hold the task
+            // now, and this one has nothing left to fail.
+        } else if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
             active
                 .publish(
                     Err(&A2AError::internal("the agent failed unexpectedly")),
@@ -1488,7 +1518,10 @@ async fn drive_execution_guarded(
                 match apply_and_publish(task_store.as_ref(), &active, Some(base), &mut event).await
                 {
                     Ok(_) => failed_event = Some(event),
-                    Err(error) => active.publish(Err(&error), None).await,
+                    Err(error) => {
+                        release_execution_locked(&manager, &active, &task_id).await;
+                        active.publish(Err(&error), None).await;
+                    }
                 }
             }
         }

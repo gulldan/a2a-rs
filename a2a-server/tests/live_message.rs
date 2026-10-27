@@ -1888,69 +1888,67 @@ async fn a_receiver_that_never_answers_does_not_hold_up_the_messages_of_a_workin
     assert_eq!(applied(&task_of(next(&mut second).await), "two"), 1);
 }
 
-/// Messages that reach a task as its turn ends are never turned away or lost:
-/// the choice between joining the running turn and starting one is made under
-/// the task's writer, which the end of a turn also takes.
+/// A message that reaches a task as an executor fails is never refused for a
+/// closed input queue: the queue is closed together with the execution being
+/// deregistered, under the writer a delivery decides under.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn concurrent_messages_to_a_task_whose_turn_just_ended_are_all_applied_once() {
-    for round in 0..40 {
-        let (handler, _) = handler(true);
+async fn messages_racing_an_executor_that_fails_are_never_refused_for_a_closed_queue() {
+    for round in 0..60 {
+        let (handler, release) = handler(true);
         let p = params("1.1");
-        // "ask" ends its turn at INPUT_REQUIRED at once.
-        let mut stream = match send("ask", None).payload {
+        let mut stream = match send("lazy-err", None).payload {
             StreamRequestPayload::SendMessage(request) => {
                 handler.send_streaming_message(&p, request).await.unwrap()
             }
             _ => unreachable!(),
         };
         let task_id = task_of(next(&mut stream).await).id;
-        while tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("the turn ends")
-            .is_some()
-        {}
+        assert_eq!(state_text(&next(&mut stream).await).1, "lazy");
 
-        let callers: Vec<_> = (0..6)
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let senders: Vec<_> = (0..4)
             .map(|i| {
-                let handler = handler.clone();
-                let p = p.clone();
-                let marker = format!("m{round}-{i}");
-                let mut request = message_request(&marker, &task_id);
-                request.configuration = Some(SendMessageConfiguration {
-                    accepted_output_modes: None,
-                    task_push_notification_config: None,
-                    history_length: None,
-                    timeline_length: None,
-                    return_immediately: Some(true),
-                    if_generation_match: None,
-                });
-                tokio::spawn(async move { (marker, handler.send_message(&p, request).await) })
+                let (handler, p, task_id, stop) =
+                    (handler.clone(), p.clone(), task_id.clone(), stop.clone());
+                tokio::spawn(async move {
+                    let mut n = 0;
+                    let mut refused = Vec::new();
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        n += 1;
+                        let mut request = message_request(&format!("s{i}-{n}"), &task_id);
+                        request.configuration = Some(SendMessageConfiguration {
+                            accepted_output_modes: None,
+                            task_push_notification_config: None,
+                            history_length: None,
+                            timeline_length: None,
+                            return_immediately: Some(true),
+                            if_generation_match: None,
+                        });
+                        if let Err(error) = handler.send_message(&p, request).await {
+                            refused.push(error.message);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    refused
+                })
             })
             .collect();
-        let mut markers = Vec::new();
-        for caller in callers {
-            let (marker, reply) = tokio::time::timeout(Duration::from_secs(5), caller)
-                .await
-                .expect("no call hangs")
-                .unwrap();
-            reply.unwrap_or_else(|error| panic!("round {round}: {marker}: {error:?}"));
-            markers.push(marker);
-        }
-        let stored = handler
-            .get_task(
-                &p,
-                GetTaskRequest {
-                    id: task_id,
-                    history_length: None,
-                    tenant: None,
-                    timeline_length: None,
-                    current_generation: None,
-                },
-            )
+        tokio::task::yield_now().await;
+        // The executor fails while the senders are at it.
+        release.notify_one();
+        while tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
-            .unwrap();
-        for marker in markers {
-            assert_eq!(applied(&stored, &marker), 1, "round {round}: {marker}");
+            .expect("the stream ends")
+            .is_some()
+        {}
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        for sender in senders {
+            for message in sender.await.unwrap() {
+                assert!(
+                    !message.contains("no longer taking input") && !message.contains("closed"),
+                    "round {round}: refused for a closed queue: {message}"
+                );
+            }
         }
     }
 }
