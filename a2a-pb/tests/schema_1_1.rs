@@ -354,7 +354,9 @@ fn artifact_only_request_has_no_message_on_the_wire() {
             generation: 0,
         }],
     };
+    // An artifact-only request has no message: no id, and no role.
     request.message.message_id = String::new();
+    request.message.role = Role::Unspecified;
 
     let proto = pbconv::to_proto_send_message_request(&request);
     assert!(proto.message.is_none(), "the message is omitted");

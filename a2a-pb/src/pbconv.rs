@@ -526,9 +526,10 @@ pub fn from_proto_send_message_configuration(
 // ---------------------------------------------------------------------------
 
 /// A request that carries only `artifactUpdates` has no message on the wire;
-/// natively that is a message with no id.
+/// natively that is a message with no id and no role.
 fn is_absent_message(r: &SendMessageRequest) -> bool {
     !r.artifact_updates.is_empty()
+        && r.message.role == Role::Unspecified
         && r.message.message_id.is_empty()
         && r.message.parts.is_empty()
         && r.message.task_id.is_none()
@@ -1832,6 +1833,14 @@ mod tests {
         };
         let back = from_proto_send_message_request(&to_proto_send_message_request(&request));
         assert_eq!(back, request);
+
+        // An empty message that does have a role is a message, and keeps it.
+        for role in [Role::User, Role::Agent] {
+            let mut with_role = request.clone();
+            with_role.message.role = role;
+            let back = from_proto_send_message_request(&to_proto_send_message_request(&with_role));
+            assert_eq!(back, with_role);
+        }
     }
 
     #[test]
