@@ -15,6 +15,15 @@ pub struct StoredTask {
 }
 
 /// Interface for persisting and retrieving tasks.
+///
+/// # Concurrency
+///
+/// `update` takes no expected version: a write replaces what is stored. The
+/// default handler serialises the changes to a task with one writer lock per
+/// task, and that lock is per process. Several server processes sharing one
+/// store are therefore not protected from each other: a store that is shared
+/// should make `update` and `begin_cancel` atomic itself, for example by
+/// checking the version of the task it replaces.
 #[async_trait]
 pub trait TaskStore: Send + Sync + 'static {
     /// Create a new task. Returns the initial version.
