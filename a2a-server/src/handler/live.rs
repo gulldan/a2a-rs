@@ -378,7 +378,7 @@ impl DefaultRequestHandler {
             StreamRequestPayload::SendMessage(request) => {
                 self.authorize(params, request_task_id(&request).as_deref())?;
                 match self
-                    .live_deliver(params, request, false)
+                    .live_deliver(params, request, StartMode::Live)
                     .await
                     .map_err(Rejection::into_error)?
                 {
@@ -485,7 +485,7 @@ impl DefaultRequestHandler {
         &self,
         params: &ServiceParams,
         request: SendMessageRequest,
-        blocking: bool,
+        mode: StartMode,
     ) -> Result<Delivery, Rejection> {
         self.validate_artifact_updates(&request)?;
         if !is_artifact_only(&request) {
@@ -510,10 +510,7 @@ impl DefaultRequestHandler {
                     Err(rejection) => return Err(rejection),
                 }
             }
-            match self
-                .start_execution(params, request.clone(), blocking)
-                .await
-            {
+            match self.start_execution(params, request.clone(), mode).await {
                 Ok((task, receiver, recorded)) => {
                     return Ok(Delivery::Started {
                         task,
@@ -547,6 +544,10 @@ impl DefaultRequestHandler {
         let Some(active) = self.execution_manager.get(task_id).await else {
             return Ok(None);
         };
+        // A task the executor has not created yet is not one a client can know.
+        if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
         let writer = active.writer.lock().await;
         // The execution may have ended, or the request preparing it failed,
         // while this waited for the lock.
@@ -1038,7 +1039,11 @@ impl LiveRun {
         self.handler
             .authorize(params, Some(&self.task_id))
             .map_err(Rejection::Failed)?;
-        match self.handler.live_deliver(params, request, false).await? {
+        match self
+            .handler
+            .live_deliver(params, request, StartMode::Live)
+            .await?
+        {
             Delivery::Started {
                 receiver, recorded, ..
             } => {

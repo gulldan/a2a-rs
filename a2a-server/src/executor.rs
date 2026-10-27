@@ -316,6 +316,25 @@ impl ExecutorContext {
         self
     }
 
+    /// A task in `state` for this execution, with this context's ids, for an
+    /// [`Agent`] to create with [`Start::Task`].
+    pub fn new_task(&self, state: TaskState) -> Task {
+        Task {
+            id: self.task_id.clone(),
+            context_id: self.context_id.clone(),
+            status: TaskStatus {
+                state,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            timeline: None,
+            metadata: None,
+            generation: 0,
+        }
+    }
+
     pub fn task_info(&self) -> (TaskId, String) {
         (self.task_id.clone(), self.context_id.clone())
     }
@@ -326,6 +345,14 @@ impl ExecutorContext {
 /// Implement this trait to handle incoming messages and cancellation requests.
 /// The executor returns a stream of events (status updates, artifact updates,
 /// messages, or task objects).
+///
+/// For a new task its first event decides whether a task exists (A2A §3.1.1):
+/// a task, status or artifact event creates it, and the server saves it then;
+/// a [`Message`] is a direct reply, nothing is saved, and whatever the
+/// executor emits afterwards is ignored (it may keep working until it
+/// returns). An executor that fails or ends without an event before that
+/// leaves no task, or the task as the request prepared it, respectively. See
+/// [`Agent`] for the same contract as a typed return value.
 #[async_trait::async_trait]
 pub trait AgentExecutor: Send + Sync + 'static {
     /// Execute a message. Returns a stream of events.
@@ -347,6 +374,120 @@ pub trait AgentExecutor: Send + Sync + 'static {
     /// without ever interrupting it holds such a call open.
     fn accepts_live_input(&self) -> bool {
         false
+    }
+}
+
+// A value built once per request and consumed at once: boxing the variants
+// would only make it harder to write.
+#[allow(clippy::large_enum_variant)]
+/// How an [`Agent`] answers a message: with a direct reply, or by creating a
+/// task (A2A §3.1.1).
+pub enum Start {
+    /// A direct reply. No task exists, and nothing is saved: neither the
+    /// client's message nor its artifacts. The call ends with the reply; an
+    /// agent that has more to do spawns it.
+    Message(Message),
+    /// The agent creates the task: `Task` is its first state (its `id` and
+    /// `context_id` are the ones in the [`ExecutorContext`]), and the
+    /// [`TaskRun`] is the work that follows.
+    Task(Task, TaskRun),
+}
+
+/// The work of a task an [`Agent`] created, after the task exists.
+pub struct TaskRun {
+    run: Box<dyn FnOnce(Option<ClientInputs>) -> EventStream + Send>,
+}
+
+type EventStream = BoxStream<'static, Result<StreamResponse, A2AError>>;
+
+impl TaskRun {
+    /// The work, given the client's input while it runs (`None` unless
+    /// [`Agent::accepts_live_input`]). It returns the events that follow the
+    /// task: status and artifact updates, until the task is terminal or waits
+    /// for input. A message the client sends while it runs arrives on the
+    /// input.
+    pub fn new<F, S>(run: F) -> Self
+    where
+        F: FnOnce(Option<ClientInputs>) -> S + Send + 'static,
+        S: futures::Stream<Item = Result<StreamResponse, A2AError>> + Send + 'static,
+    {
+        TaskRun {
+            run: Box::new(move |inputs| Box::pin(run(inputs))),
+        }
+    }
+
+    /// No further events: the task stays as it was created.
+    pub fn finished() -> Self {
+        TaskRun::new(|_| futures::stream::empty())
+    }
+
+    fn run(
+        self,
+        inputs: Option<ClientInputs>,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        (self.run)(inputs)
+    }
+}
+
+/// An agent that decides, for each message, whether a task exists.
+///
+/// The server creates and saves a task only when [`Agent::start`] returns
+/// [`Start::Task`], and queues the client's messages for it only from then on.
+/// [`AgentExecutor`] is the same contract as a stream of events, whose first
+/// event decides; it runs on the server unchanged.
+#[async_trait::async_trait]
+pub trait Agent: Send + Sync + 'static {
+    /// Starts on `ctx.message`: a direct reply, or the task and its work.
+    async fn start(&self, ctx: ExecutorContext) -> Result<Start, A2AError>;
+
+    /// Cancels an in-progress task. Returns a stream of events.
+    fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>>;
+
+    /// Whether the [`TaskRun`] reads the client's messages while it works; see
+    /// [`AgentExecutor::accepts_live_input`].
+    fn accepts_live_input(&self) -> bool {
+        false
+    }
+}
+
+/// An [`Agent`] as the executor the server drives: the first event is the
+/// task, or the direct reply.
+pub(crate) struct AgentExecutorAdapter<A: Agent>(pub(crate) Arc<A>);
+
+impl<A: Agent> AgentExecutor for AgentExecutorAdapter<A> {
+    fn execute(
+        &self,
+        mut ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        use futures::StreamExt;
+
+        let agent = Arc::clone(&self.0);
+        Box::pin(
+            futures::stream::once(async move {
+                let inputs = ctx.inputs.take();
+                match agent.start(ctx).await {
+                    Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
+                    Ok(Start::Message(message)) => {
+                        futures::stream::once(async move { Ok(StreamResponse::Message(message)) })
+                            .boxed()
+                    }
+                    Ok(Start::Task(task, run)) => {
+                        futures::stream::once(async move { Ok(StreamResponse::Task(task)) })
+                            .chain(run.run(inputs))
+                            .boxed()
+                    }
+                }
+            })
+            .flatten(),
+        )
+    }
+
+    fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        self.0.cancel(ctx)
+    }
+
+    fn accepts_live_input(&self) -> bool {
+        self.0.accepts_live_input()
     }
 }
 

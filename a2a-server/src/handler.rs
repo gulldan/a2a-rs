@@ -56,6 +56,9 @@ enum EventKind {
     /// Something only a live exchange is told (a `StreamError` about a message
     /// of its own), not the other subscribers of the task.
     LiveOnly,
+    /// The executor's direct reply, with no task: the last thing any stream
+    /// following the execution is sent.
+    Reply,
 }
 
 #[derive(Default)]
@@ -80,6 +83,10 @@ struct ActiveExecution {
     /// Where live client messages go while the executor runs; set once, when
     /// the executor accepts live input.
     inputs: std::sync::OnceLock<Arc<InputQueue>>,
+    /// Set while the task this execution is for has not been created: a new
+    /// task is created by the executor's first event, and does not exist if
+    /// the executor answers with a message alone.
+    uncreated: std::sync::atomic::AtomicBool,
 }
 
 impl ActiveExecution {
@@ -98,6 +105,7 @@ impl ActiveExecution {
             }),
             writer,
             inputs: std::sync::OnceLock::new(),
+            uncreated: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1058,6 +1066,7 @@ fn subscription_stream(
                         match &event.result {
                             Ok(item) if is_terminal_event(item) => state.done = true,
                             Err(_) => state.done = true,
+                            _ if event.kind == EventKind::Reply => state.done = true,
                             _ => {}
                         }
                         return Some((event.result.clone(), state));
@@ -1094,6 +1103,35 @@ async fn drive_execution(
         }
 
         match result {
+            Ok(event)
+                if active.uncreated.load(std::sync::atomic::Ordering::SeqCst)
+                    && matches!(event, StreamResponse::Message(_)) =>
+            {
+                // The executor answered with a message alone: there is no task,
+                // and nothing is saved. The reply is the last thing a stream
+                // following this execution is sent.
+                {
+                    let _writer = active.writer.lock().await;
+                    active
+                        .publish_kind(Ok(&event), None, EventKind::Reply)
+                        .await;
+                }
+                reject_unread_inputs(&active, &task_id).await;
+                runtime.execution_manager.finish(&task_id, &active).await;
+                runtime.task_changed.notify_waiters();
+                finished = true;
+                // The executor may go on working until it returns, but nothing
+                // it says now belongs to any task.
+                while let Some(rest) = stream.next().await {
+                    if rest.is_ok() {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            "the executor emitted an event after a direct reply; ignored"
+                        );
+                    }
+                }
+                break;
+            }
             Ok(mut event) => {
                 backfill_status_timestamp(&mut event);
                 // One writer at a time: the snapshot is read, changed, saved
@@ -1135,6 +1173,11 @@ async fn drive_execution(
                         }
                     }
                 };
+                // Whatever the first event was, the executor has spoken: the task
+                // exists, or the event was refused and there is none.
+                active
+                    .uncreated
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 let Some(published) = published else {
                     break;
                 };
@@ -1211,6 +1254,11 @@ async fn drive_execution(
                 }
             }
             Err(error) => {
+                // An executor that fails before it has said anything created
+                // no task.
+                active
+                    .uncreated
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 fail_execution(&active, &task_id, &error).await;
                 break;
             }
@@ -1218,6 +1266,19 @@ async fn drive_execution(
     }
 
     if !finished {
+        // An executor that ended without saying anything still has a task: the
+        // one the request prepared.
+        if active
+            .uncreated
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _writer = active.writer.lock().await;
+            if let Some(task) = active.snapshot().await {
+                if let Err(error) = save_task(runtime.task_store.as_ref(), task).await {
+                    tracing::warn!(task_id = %task_id, %error, "could not create the task");
+                }
+            }
+        }
         reject_unread_inputs(&active, &task_id).await;
         runtime.execution_manager.finish(&task_id, &active).await;
         runtime.task_changed.notify_waiters();
@@ -1535,6 +1596,15 @@ impl DefaultRequestHandler {
         }
     }
 
+    /// A handler for an [`Agent`](crate::Agent), which decides for each message
+    /// whether a task exists.
+    pub fn from_agent(agent: impl crate::Agent, task_store: impl crate::TaskStore) -> Self {
+        Self::new(
+            crate::executor::AgentExecutorAdapter(Arc::new(agent)),
+            task_store,
+        )
+    }
+
     /// Bounds how long a `GetTask` carrying `currentGeneration` is held open
     /// when the task does not advance. The request then returns the current
     /// state, which the spec allows.
@@ -1732,6 +1802,7 @@ impl DefaultRequestHandler {
         &self,
         req: &SendMessageRequest,
         task_id: &str,
+        lazy: bool,
     ) -> Result<(Task, bool, String, Vec<StreamResponse>), A2AError> {
         let artifact_only = is_artifact_only(req);
         // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
@@ -1835,7 +1906,11 @@ impl DefaultRequestHandler {
                     .into_iter()
                     .map(StreamResponse::ArtifactUpdate),
             );
-            self.task_store.create(task.clone()).await?;
+            // A task the executor has yet to create is only prepared: it is
+            // saved with the executor's first event, or not at all.
+            if !lazy {
+                self.task_store.create(task.clone()).await?;
+            }
             task
         };
 
@@ -2180,7 +2255,7 @@ impl DefaultRequestHandler {
         &self,
         params: &ServiceParams,
         req: SendMessageRequest,
-        include_task_snapshot_in_context: bool,
+        mode: StartMode,
     ) -> Result<
         (
             Task,
@@ -2189,6 +2264,10 @@ impl DefaultRequestHandler {
         ),
         A2AError,
     > {
+        let include_task_snapshot_in_context = mode == StartMode::Blocking;
+        // A new task is created by the executor: only a live exchange, which is
+        // bound to its task from the first request, creates it up front.
+        let lazy = mode != StartMode::Live;
         let artifact_only = is_artifact_only(&req);
         if !artifact_only {
             if req.message.message_id.is_empty() && !req.artifact_updates.is_empty() {
@@ -2223,7 +2302,9 @@ impl DefaultRequestHandler {
             // is set, makes a cancel or a subscriber that finds this execution
             // wait for it instead of racing it.
             let prepared = async {
-                let prepared = self.prepare_task_for_execution(&req, &task_id).await?;
+                let prepared = self
+                    .prepare_task_for_execution(&req, &task_id, lazy)
+                    .await?;
                 self.save_request_push_config(params, &task_id, &req)
                     .await?;
                 Ok::<_, A2AError>(prepared)
@@ -2232,6 +2313,11 @@ impl DefaultRequestHandler {
             match prepared {
                 Ok(prepared) => {
                     active.set_snapshot(prepared.0.clone()).await;
+                    if lazy && !prepared.1 {
+                        active
+                            .uncreated
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     prepared
                 }
                 Err(error) => {
@@ -2305,6 +2391,17 @@ impl DefaultRequestHandler {
     }
 }
 
+/// How a request reaches `start_execution`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartMode {
+    /// `SendMessage` that waits for the result.
+    Blocking,
+    /// `SendStreamingMessage`.
+    Streaming,
+    /// The first request of a live exchange.
+    Live,
+}
+
 /// Opens a stream with the task, as A2A requires of a streaming send
 /// (§3.1.2). An agent that answers with a message alone gets a stream that is
 /// that message and nothing else, and one whose first event is already a task
@@ -2353,7 +2450,7 @@ impl RequestHandler for DefaultRequestHandler {
             .as_ref()
             .and_then(|configuration| configuration.timeline_length);
         let (task_id, receiver, min_sequence) = match self
-            .live_deliver(params, req.clone(), true)
+            .live_deliver(params, req.clone(), StartMode::Blocking)
             .await
             .map_err(|rejection| unary_refusal(rejection, &req))?
         {
@@ -2434,7 +2531,7 @@ impl RequestHandler for DefaultRequestHandler {
         self.authorize(params, request_task_id(&req).as_deref())?;
         self.require_streaming()?;
         let (task, receiver, min_sequence) = match self
-            .live_deliver(params, req.clone(), false)
+            .live_deliver(params, req.clone(), StartMode::Streaming)
             .await
             .map_err(|rejection| unary_refusal(rejection, &req))?
         {
