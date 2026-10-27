@@ -560,13 +560,16 @@ pub fn from_proto_send_message_request(r: &proto::SendMessageRequest) -> SendMes
             .as_ref()
             .map(from_proto_message)
             .unwrap_or_else(|| {
-                let mut message = Message::new(Role::User, vec![]);
                 // The message may be omitted when `artifactUpdates` target an
-                // existing task; it is then marked by having no id.
-                if !r.artifact_updates.is_empty() {
+                // existing task; it is then marked by having no id (and no
+                // role, so that the empty message encodes back to nothing).
+                if r.artifact_updates.is_empty() {
+                    Message::new(Role::User, vec![])
+                } else {
+                    let mut message = Message::new(Role::Unspecified, vec![]);
                     message.message_id = String::new();
+                    message
                 }
-                message
             }),
         configuration: r
             .configuration
@@ -1794,6 +1797,41 @@ mod tests {
             req.configuration.as_ref().unwrap().return_immediately,
             back.configuration.as_ref().unwrap().return_immediately
         );
+    }
+
+    #[test]
+    fn test_artifact_only_request_survives_the_round_trip_unchanged() {
+        let request = SendMessageRequest {
+            message: Message {
+                role: Role::Unspecified,
+                message_id: String::new(),
+                ..Message::new(Role::Unspecified, vec![])
+            },
+            configuration: None,
+            metadata: None,
+            tenant: None,
+            artifact_updates: vec![TaskArtifactUpdateEvent {
+                generation: 0,
+                task_id: "t1".to_string(),
+                context_id: "c1".to_string(),
+                artifact: Artifact {
+                    end_generation: None,
+                    role: None,
+                    start_generation: None,
+                    artifact_id: "a1".to_string(),
+                    name: None,
+                    description: None,
+                    parts: vec![Part::text("data")],
+                    metadata: None,
+                    extensions: None,
+                },
+                append: None,
+                last_chunk: None,
+                metadata: None,
+            }],
+        };
+        let back = from_proto_send_message_request(&to_proto_send_message_request(&request));
+        assert_eq!(back, request);
     }
 
     #[test]
