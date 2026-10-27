@@ -263,6 +263,16 @@ impl ExecutionManager {
     ) -> Result<(Arc<ActiveExecution>, tokio::sync::OwnedMutexGuard<()>), A2AError> {
         let writer = self.writer_for(task_id);
         let guard = Arc::clone(&writer).lock_owned().await;
+        self.reserve_held(task_id, guard).await
+    }
+
+    /// [`Self::reserve`] for a caller that already holds the task's writer.
+    async fn reserve_held(
+        &self,
+        task_id: &str,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(Arc<ActiveExecution>, tokio::sync::OwnedMutexGuard<()>), A2AError> {
+        let writer = self.writer_for(task_id);
         let mut executions = self.executions.write().await;
         if let Some(existing) = executions.get(task_id) {
             // A live reservation holds the writer until its snapshot is set,
@@ -1158,8 +1168,7 @@ async fn drive_execution(
                         .publish_kind(Ok(&event), None, EventKind::Reply)
                         .await;
                 }
-                reject_unread_inputs(&active, &task_id).await;
-                runtime.execution_manager.finish(&task_id, &active).await;
+                release_execution(&runtime.execution_manager, &active, &task_id).await;
                 runtime.task_changed.notify_waiters();
                 finished = true;
                 // The executor may go on working until it returns, but nothing
@@ -1260,8 +1269,7 @@ async fn drive_execution(
                             .lock_owned(),
                     );
                     let held = futures::poll!(ordered.as_mut());
-                    reject_unread_inputs(&active, &task_id).await;
-                    runtime.execution_manager.finish(&task_id, &active).await;
+                    release_execution(&runtime.execution_manager, &active, &task_id).await;
                     runtime.task_changed.notify_waiters();
                     finished = true;
                     let (store, sender) = (
@@ -1332,10 +1340,24 @@ async fn drive_execution(
                 }
             }
         }
-        reject_unread_inputs(&active, &task_id).await;
-        runtime.execution_manager.finish(&task_id, &active).await;
+        release_execution(&runtime.execution_manager, &active, &task_id).await;
         runtime.task_changed.notify_waiters();
     }
+}
+
+/// Ends an execution's hold on its task in one step, under the task's writer:
+/// the live-input queue is closed (what the executor never read is answered)
+/// and the execution deregistered together. A message delivered to the task
+/// decides under the same writer, so it finds either a running execution that
+/// is taking input, or none.
+async fn release_execution(
+    manager: &ExecutionManager,
+    active: &Arc<ActiveExecution>,
+    task_id: &str,
+) {
+    let _writer = active.writer.lock().await;
+    reject_unread_inputs_locked(active, task_id).await;
+    manager.finish(task_id, active).await;
 }
 
 /// Saves the push configuration the request that started the execution
@@ -1485,7 +1507,7 @@ async fn drive_execution_guarded(
             tracing::warn!(task_id = %task_id, %error, "could not push the failure");
         }
     }
-    manager.finish(&task_id, &active).await;
+    release_execution(&manager, &active, &task_id).await;
     task_changed.notify_waiters();
 }
 
@@ -2346,6 +2368,7 @@ impl DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
         mode: StartMode,
+        writer: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<
         (
             Task,
@@ -2381,7 +2404,10 @@ impl DefaultRequestHandler {
         // Claim the task before reading it: from here until the execution
         // ends, this request and a cancel are the only writers. The guard gives the claim back
         // on every early return and if this future is dropped.
-        let (active, writer_guard) = self.execution_manager.reserve(&task_id).await?;
+        let (active, writer_guard) = match writer {
+            Some(held) => self.execution_manager.reserve_held(&task_id, held).await?,
+            None => self.execution_manager.reserve(&task_id).await?,
+        };
         let reservation = ReservationGuard::new(
             Arc::clone(&self.execution_manager),
             task_id.clone(),

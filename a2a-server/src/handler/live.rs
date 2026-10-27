@@ -247,12 +247,6 @@ pub(super) enum Delivery {
     },
 }
 
-/// Whether `error` is the refusal of a second execution for a task that is
-/// already running one.
-fn is_in_progress(error: &A2AError) -> bool {
-    error.code == error_code::INVALID_REQUEST && error.message.contains("already in progress")
-}
-
 /// The generation an event reports, if it reports one.
 fn generation_of(event: &StreamResponse) -> Option<i64> {
     match event {
@@ -481,6 +475,10 @@ impl DefaultRequestHandler {
 
     /// Hands a message to a task: into the execution that is running, or as the
     /// start of a new turn.
+    ///
+    /// The choice and what follows from it happen under the task's writer, which
+    /// the end of a turn also takes to close its input queue and deregister: the
+    /// message finds either a running execution that is taking input, or none.
     pub(super) async fn live_deliver(
         &self,
         params: &ServiceParams,
@@ -491,74 +489,69 @@ impl DefaultRequestHandler {
         if !is_artifact_only(&request) {
             self.validate_content_types(&request.message)?;
         }
-        let task_id = request_task_id(&request);
-        let mut last_error = None;
-        // Another request may start the task between the look and the start, and
-        // finish before the message can join it: each lap looks again.
-        for _ in 0..3 {
-            if let Some(task_id) = &task_id {
-                match self.try_inject(params, &request, task_id).await {
-                    Ok(Some(delivery)) => return Ok(delivery),
-                    Ok(None) => {}
-                    // The turn is ending: once it has finished, the message
-                    // starts the next one.
-                    Err(Rejection::Declined(reason)) if reason == INPUT_CLOSED => {
-                        last_error = Some(A2AError::unsupported_operation(reason));
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                        continue;
-                    }
-                    Err(rejection) => return Err(rejection),
-                }
+        // No task named: the message creates one, and there is nothing to join.
+        let Some(task_id) = request_task_id(&request) else {
+            return self.start_delivery(params, request, mode, None).await;
+        };
+        let writer = self
+            .execution_manager
+            .writer_for(&task_id)
+            .lock_owned()
+            .await;
+        // An entry with no snapshot is a request that was dropped before it
+        // began; it is no execution.
+        let running = match self.execution_manager.get(&task_id).await {
+            Some(active) if active.snapshot().await.is_some() => Some(active),
+            _ => None,
+        };
+        match running {
+            Some(active) => {
+                self.inject(params, &request, &task_id, &active, writer)
+                    .await
             }
-            match self.start_execution(params, request.clone(), mode).await {
-                Ok((task, receiver, recorded)) => {
-                    return Ok(Delivery::Started {
-                        task,
-                        receiver,
-                        recorded,
-                    });
-                }
-                Err(error) if is_in_progress(&error) && task_id.is_some() => {
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(Rejection::Failed(error)),
+            None => {
+                self.start_delivery(params, request, mode, Some(writer))
+                    .await
             }
         }
-        Err(match last_error {
-            Some(error) if error.code == error_code::UNSUPPORTED_OPERATION => {
-                Rejection::Declined(error.message)
-            }
-            Some(error) => Rejection::Failed(error),
-            None => Rejection::Failed(A2AError::internal("could not deliver the message")),
+    }
+
+    async fn start_delivery(
+        &self,
+        params: &ServiceParams,
+        request: SendMessageRequest,
+        mode: StartMode,
+        writer: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<Delivery, Rejection> {
+        let (task, receiver, recorded) = self
+            .start_execution(params, request, mode, writer)
+            .await
+            .map_err(Rejection::Failed)?;
+        Ok(Delivery::Started {
+            task,
+            receiver,
+            recorded,
         })
     }
 
-    /// Appends the message to the task under the writer lock and passes it to
-    /// the running executor. `None` when no execution is running.
-    async fn try_inject(
+    /// Appends the message to the task and passes it to the running executor,
+    /// under `writer`, which the caller holds for the task.
+    async fn inject(
         &self,
         params: &ServiceParams,
         request: &SendMessageRequest,
         task_id: &str,
-    ) -> Result<Option<Delivery>, Rejection> {
-        let Some(active) = self.execution_manager.get(task_id).await else {
-            return Ok(None);
-        };
-        let writer = active.writer.lock().await;
+        active: &Arc<ActiveExecution>,
+        writer: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<Delivery, Rejection> {
         // A task the executor has not created yet is not one a client can know.
         if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(None);
+            return Err(Rejection::Failed(A2AError::task_not_found(task_id)));
         }
-        // The execution may have ended, or the request preparing it failed,
-        // while this waited for the lock.
-        let registered = self
-            .execution_manager
-            .get(task_id)
-            .await
-            .is_some_and(|current| Arc::ptr_eq(&current, &active));
-        let base = match (registered, active.snapshot().await) {
-            (true, Some(base)) => base,
-            _ => return Ok(None),
+        let Some(base) = active.snapshot().await else {
+            return Err(Rejection::Failed(A2AError::internal(
+                "a running execution has no task",
+            )));
         };
         if base.status.state.is_terminal() {
             return Err(Rejection::Failed(A2AError::unsupported_operation(format!(
@@ -677,12 +670,12 @@ impl DefaultRequestHandler {
         drop(writer);
         self.task_changed.notify_waiters();
 
-        Ok(Some(Delivery::Injected {
+        Ok(Delivery::Injected {
             task,
             receiver,
             sequence_before,
             sequence_after,
-        }))
+        })
     }
 }
 

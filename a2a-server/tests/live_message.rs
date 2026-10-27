@@ -1887,3 +1887,70 @@ async fn a_receiver_that_never_answers_does_not_hold_up_the_messages_of_a_workin
     // The call that took the message answered at once, with the task holding it.
     assert_eq!(applied(&task_of(next(&mut second).await), "two"), 1);
 }
+
+/// Messages that reach a task as its turn ends are never turned away or lost:
+/// the choice between joining the running turn and starting one is made under
+/// the task's writer, which the end of a turn also takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_messages_to_a_task_whose_turn_just_ended_are_all_applied_once() {
+    for round in 0..40 {
+        let (handler, _) = handler(true);
+        let p = params("1.1");
+        // "ask" ends its turn at INPUT_REQUIRED at once.
+        let mut stream = match send("ask", None).payload {
+            StreamRequestPayload::SendMessage(request) => {
+                handler.send_streaming_message(&p, request).await.unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let task_id = task_of(next(&mut stream).await).id;
+        while tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the turn ends")
+            .is_some()
+        {}
+
+        let callers: Vec<_> = (0..6)
+            .map(|i| {
+                let handler = handler.clone();
+                let p = p.clone();
+                let marker = format!("m{round}-{i}");
+                let mut request = message_request(&marker, &task_id);
+                request.configuration = Some(SendMessageConfiguration {
+                    accepted_output_modes: None,
+                    task_push_notification_config: None,
+                    history_length: None,
+                    timeline_length: None,
+                    return_immediately: Some(true),
+                    if_generation_match: None,
+                });
+                tokio::spawn(async move { (marker, handler.send_message(&p, request).await) })
+            })
+            .collect();
+        let mut markers = Vec::new();
+        for caller in callers {
+            let (marker, reply) = tokio::time::timeout(Duration::from_secs(5), caller)
+                .await
+                .expect("no call hangs")
+                .unwrap();
+            reply.unwrap_or_else(|error| panic!("round {round}: {marker}: {error:?}"));
+            markers.push(marker);
+        }
+        let stored = handler
+            .get_task(
+                &p,
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                    timeline_length: None,
+                    current_generation: None,
+                },
+            )
+            .await
+            .unwrap();
+        for marker in markers {
+            assert_eq!(applied(&stored, &marker), 1, "round {round}: {marker}");
+        }
+    }
+}
