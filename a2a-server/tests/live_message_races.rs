@@ -437,7 +437,8 @@ async fn an_exchange_that_fell_behind_ends_when_the_next_turn_starts() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
-        up.send(send("ask", Some(&task.id))).await.unwrap();
+        // The exchange may already have ended on the lag it saw as the turn ran.
+        let _ = up.send(send("ask", Some(&task.id))).await;
         // An error ends the downlink: nothing follows it.
         let ended = tokio::time::timeout(Duration::from_secs(3), async {
             let mut failed = false;
