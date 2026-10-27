@@ -21,9 +21,9 @@
 //!   message id, cannot be checked and is acknowledged.
 //! - A message injected into a turn another client started reaches an idle
 //!   exchange through the next snapshot, not as events.
-//! - An executor that publishes more than the execution buffer holds
-//!   (`EXECUTION_BUFFER_CAPACITY` events) faster than a session drains them
-//!   ends that exchange with an error, as it does a streaming subscription.
+//! - A stream that falls further behind than the execution buffer holds
+//!   (`EXECUTION_BUFFER_CAPACITY` events) starts over from the task as it
+//!   stands, a snapshot with a gap in the generations, as for any subscription.
 //! - Without replay, `lastSeenGeneration` resumes from a snapshot.
 //! - Webhook deliveries are queued per task, in publish order, and never waited
 //!   for. A receiver that is down or slow delays only its own task's deliveries,
@@ -219,7 +219,7 @@ pub(super) enum Delivery {
     /// The message started a new turn.
     Started {
         task: Task,
-        receiver: broadcast::Receiver<ExecutionEvent>,
+        receiver: ExecutionReceiver,
         /// What the request recorded before the turn began, as events: the
         /// message as it was appended, then each artifact. A stream that
         /// already holds the task is told them; the first request's opening
@@ -229,7 +229,7 @@ pub(super) enum Delivery {
     /// The message went into the execution that was running.
     Injected {
         task: Task,
-        receiver: broadcast::Receiver<ExecutionEvent>,
+        receiver: ExecutionReceiver,
         /// The execution's sequence before the message's events were published,
         /// and after: a stream that already holds the task resumes after the
         /// latter, one that joins now takes them from the former.

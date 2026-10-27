@@ -61,6 +61,36 @@ enum EventKind {
     Reply,
 }
 
+/// A subscription to an execution's events. One that falls further behind than
+/// the buffer holds can start over from the task as it stands, which is what a
+/// client that sees a gap in the generations does anyway.
+struct ExecutionReceiver {
+    receiver: broadcast::Receiver<ExecutionEvent>,
+    /// Weak: a subscription must not keep a finished execution open.
+    execution: std::sync::Weak<ActiveExecution>,
+}
+
+impl ExecutionReceiver {
+    async fn recv(&mut self) -> Result<ExecutionEvent, broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<ExecutionEvent, broadcast::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    /// Starts over after the events were lost: the task as it stands, and the
+    /// sequence after which events follow it. `None` when the execution is
+    /// over or has no task yet.
+    async fn resync(&mut self) -> Option<(Task, u64)> {
+        let execution = self.execution.upgrade()?;
+        let (receiver, snapshot, sequence) = execution.resubscribe().await;
+        self.receiver = receiver.receiver;
+        snapshot.map(|task| (task, sequence))
+    }
+}
+
 #[derive(Default)]
 struct ActiveExecutionState {
     sequence: u64,
@@ -120,12 +150,15 @@ impl ActiveExecution {
         self.state.write().await.snapshot_task = Some(task);
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<ExecutionEvent> {
-        self.sender.subscribe()
+    fn subscribe(self: &Arc<Self>) -> ExecutionReceiver {
+        ExecutionReceiver {
+            receiver: self.sender.subscribe(),
+            execution: Arc::downgrade(self),
+        }
     }
 
-    async fn resubscribe(&self) -> (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64) {
-        let receiver = self.sender.subscribe();
+    async fn resubscribe(self: &Arc<Self>) -> (ExecutionReceiver, Option<Task>, u64) {
+        let receiver = self.subscribe();
         let state = self.state.read().await;
         (receiver, state.snapshot_task.clone(), state.sequence)
     }
@@ -450,10 +483,7 @@ impl ExecutionManager {
         executions.get(task_id).cloned()
     }
 
-    async fn resubscribe(
-        &self,
-        task_id: &str,
-    ) -> Option<(broadcast::Receiver<ExecutionEvent>, Option<Task>, u64)> {
+    async fn resubscribe(&self, task_id: &str) -> Option<(ExecutionReceiver, Option<Task>, u64)> {
         let active = self.get(task_id).await?;
         let (receiver, snapshot_task, sequence) = active.resubscribe().await;
         Some((receiver, snapshot_task, sequence))
@@ -553,7 +583,7 @@ struct ExecutionRuntime {
 }
 
 struct SubscriptionState {
-    receiver: broadcast::Receiver<ExecutionEvent>,
+    receiver: ExecutionReceiver,
     snapshot_task: Option<Task>,
     min_sequence: u64,
     done: bool,
@@ -1166,7 +1196,7 @@ async fn apply_and_publish_with(
 }
 
 fn subscription_stream(
-    receiver: broadcast::Receiver<ExecutionEvent>,
+    receiver: ExecutionReceiver,
     snapshot_task: Option<Task>,
     min_sequence: u64,
     include_repeats: bool,
@@ -1223,14 +1253,18 @@ fn subscription_stream(
                         }
                         return Some((event.result.clone(), state));
                     }
+                    // Events were lost: start over from the task as it stands.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        state.done = true;
-                        return Some((
-                            Err(crate::sanitized_internal_error(
-                                "subscription fell behind active execution",
-                            )),
-                            state,
-                        ));
+                        match state.receiver.resync().await {
+                            Some((task, sequence)) => {
+                                state.min_sequence = sequence;
+                                if task.status.state.is_terminal() {
+                                    state.done = true;
+                                }
+                                return Some((Ok(StreamResponse::Task(task)), state));
+                            }
+                            None => return None,
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
@@ -2551,14 +2585,7 @@ impl DefaultRequestHandler {
         req: SendMessageRequest,
         mode: StartMode,
         writer: Option<tokio::sync::OwnedMutexGuard<()>>,
-    ) -> Result<
-        (
-            Task,
-            broadcast::Receiver<ExecutionEvent>,
-            Vec<StreamResponse>,
-        ),
-        A2AError,
-    > {
+    ) -> Result<(Task, ExecutionReceiver, Vec<StreamResponse>), A2AError> {
         let include_task_snapshot_in_context = mode == StartMode::Blocking;
         // A new task is created by the executor: only a live exchange, which is
         // bound to its task from the first request, creates it up front.
@@ -6274,37 +6301,53 @@ mod lag_coverage_tests {
     }
 
     #[tokio::test]
-    async fn test_subscription_lag_is_reported_as_a_sanitized_internal_error() {
-        // A subscriber that falls behind the active execution gets a generic
-        // INTERNAL_ERROR rather than the broadcast internals, and the stream
-        // terminates instead of spinning on a lost buffer.
-        let (sender, receiver) = broadcast::channel(1);
-
-        for sequence in 0..4 {
-            let _ = sender.send(ExecutionEvent {
-                sequence,
-                result: Ok(StreamResponse::Message(a2a::Message {
-                    message_id: "lag-probe".to_string(),
-                    role: a2a::Role::Agent,
-                    parts: Vec::new(),
-                    context_id: None,
-                    task_id: None,
-                    metadata: None,
-                    extensions: None,
-                    reference_task_ids: None,
-                })),
-                kind: EventKind::Normal,
-            });
+    async fn test_a_subscriber_that_falls_behind_starts_over_from_the_task() {
+        // A subscriber further behind than the buffer holds is given the task as
+        // it stands and carries on after it, instead of losing its stream.
+        let task = Task {
+            id: "t-lag".into(),
+            context_id: "c".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            timeline: None,
+            metadata: None,
+            generation: 7,
+        };
+        let active = ActiveExecution::new(Some(task));
+        let receiver = active.subscribe();
+        let probe = |text: &str| {
+            StreamResponse::Message(a2a::Message {
+                message_id: text.to_string(),
+                role: a2a::Role::Agent,
+                parts: Vec::new(),
+                context_id: None,
+                task_id: None,
+                metadata: None,
+                extensions: None,
+                reference_task_ids: None,
+            })
+        };
+        for i in 0..(EXECUTION_BUFFER_CAPACITY * 3) {
+            active.publish(Ok(&probe(&format!("lost-{i}"))), None).await;
         }
 
         let mut stream = subscription_stream(receiver, None, 0, true, false, false);
-        let item = stream.next().await.expect("lagged item");
-
-        let error = item.expect_err("lag must surface as an error");
-        assert_eq!(error.code, a2a::error_code::INTERNAL_ERROR);
-        assert_eq!(error.message, "Internal error");
-
-        // `done` is set on lag, so the stream ends rather than repeating.
-        assert!(stream.next().await.is_none());
+        let first = stream.next().await.expect("an item").expect("not an error");
+        assert!(
+            matches!(&first, StreamResponse::Task(task) if task.generation == 7),
+            "{first:?}"
+        );
+        // And what is published afterwards follows.
+        active.publish(Ok(&probe("after")), None).await;
+        let next = stream.next().await.expect("an item").expect("not an error");
+        assert!(
+            matches!(&next, StreamResponse::Message(m) if m.message_id == "after"),
+            "{next:?}"
+        );
     }
 }

@@ -422,12 +422,12 @@ async fn p5_message_at_turn_end_is_not_declined() {
     assert_eq!(a + b, 0);
 }
 
-/// A session that fell behind the turn that just ended is told so and the
-/// exchange ends, whether it notices as it follows the turn or as the next
-/// message starts a new one.
+/// A session that fell behind the turn that just ended starts over from the
+/// task, and the exchange carries on: the next message gets its turn, and no
+/// error ends the stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_exchange_that_fell_behind_ends_when_the_next_turn_starts() {
-    for round in 0..30 {
+async fn an_exchange_that_fell_behind_carries_on_from_the_task() {
+    for round in 0..20 {
         let (h, _) = handler_with(true);
         let p = params("1.1", "a");
         let (up, rx) = mpsc::channel(8);
@@ -440,28 +440,31 @@ async fn an_exchange_that_fell_behind_ends_when_the_next_turn_starts() {
             StreamResponse::Task(t) => t,
             other => panic!("{other:?}"),
         };
+        // The turn publishes far more than the buffer holds while nobody reads.
         loop {
             if get(&h, &task.id).await.status.state == TaskState::InputRequired {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        // The exchange may already have ended on the lag it saw as the turn ran.
-        let _ = up.send(send("ask", Some(&task.id))).await;
-        // An error ends the downlink: nothing follows it.
-        let ended = tokio::time::timeout(Duration::from_secs(3), async {
-            let mut failed = false;
-            while let Some(item) = down.next().await {
-                failed |= item.is_err();
+        up.send(send("ask", Some(&task.id)))
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the exchange ended"));
+        // The exchange goes on to the next turn, with no error on the way.
+        let reached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match down.next().await {
+                    Some(Ok(event)) => {
+                        if text(&event).as_deref() == Some("need input") {
+                            return;
+                        }
+                    }
+                    Some(Err(error)) => panic!("round {round}: {error:?}"),
+                    None => panic!("round {round}: the exchange ended"),
+                }
             }
-            failed
         })
         .await;
-        assert_eq!(
-            ended,
-            Ok(true),
-            "round {round}: the exchange went on after the error"
-        );
+        assert!(reached.is_ok(), "round {round}: the next turn was not seen");
     }
 }
