@@ -10,6 +10,21 @@
 //! message starts a new turn), and it keeps the downlink open across turns:
 //! only a terminal task, a client that goes away, or an uplink that ends with
 //! nothing left to say closes it.
+//!
+//! # Known limitations
+//!
+//! - A call another client routes into an exchange it did not open has no
+//!   downlink: a rejection goes to the opener's downlink and the caller gets
+//!   the task back, in which it can see its message is missing.
+//! - A call lost to a panic is acknowledged when its message is in the task,
+//!   even if no executor read it; an artifact-only call, or one with no
+//!   message id, cannot be checked and is acknowledged.
+//! - A message injected into a turn another client started reaches an idle
+//!   exchange through the next snapshot, not as events.
+//! - An executor that publishes more than the execution buffer holds
+//!   (`EXECUTION_BUFFER_CAPACITY` events) faster than a session drains them
+//!   ends that exchange with an error, as it does a streaming subscription.
+//! - Without replay, `lastSeenGeneration` resumes from a snapshot.
 
 use super::*;
 use crate::executor::{ClientInput, InputRefusal};
@@ -182,6 +197,9 @@ impl Rejection {
     }
 }
 
+/// Why a message is declined when its turn has closed its input queue.
+const INPUT_CLOSED: &str = "the agent is no longer taking input";
+
 fn stream_error_code(error: &A2AError) -> String {
     match error.code {
         error_code::INVALID_PARAMS
@@ -219,9 +237,6 @@ enum Delivery {
 
 /// Whether `error` is the refusal of a second execution for a task that is
 /// already running one.
-/// Why a message is declined when its turn has closed its input queue.
-const INPUT_CLOSED: &str = "the agent is no longer taking input";
-
 fn is_in_progress(error: &A2AError) -> bool {
     error.code == error_code::INVALID_REQUEST && error.message.contains("already in progress")
 }
@@ -900,7 +915,7 @@ impl LiveRun {
         let ack = ack.map(AckGuard::into_sender);
         let params = params.unwrap_or_else(|| self.params.clone());
         let mut reference_id = None;
-        let result: Result<(), Rejection> = match request.payload {
+        let result: Result<bool, Rejection> = match request.payload {
             StreamRequestPayload::SendMessage(mut request) => {
                 reference_id = Some(request.message.message_id.clone())
                     .filter(|id| !id.is_empty())
@@ -928,7 +943,7 @@ impl LiveRun {
                 "unrecognised StreamRequest payload",
             ))),
         };
-        let mut downlink_open = true;
+        let mut downlink_open = *result.as_ref().unwrap_or(&true);
         if let Err(rejection) = result {
             // Ordering is by arrival: what the exchange has already published
             // for earlier requests goes out before this one's rejection.
@@ -1004,7 +1019,7 @@ impl LiveRun {
         inner: &mut Option<Events>,
         last_generation: &mut i64,
         out: &Downlink,
-    ) -> Result<(), Rejection> {
+    ) -> Result<bool, Rejection> {
         self.handler
             .authorize(params, Some(&self.task_id))
             .map_err(Rejection::Failed)?;
@@ -1015,7 +1030,7 @@ impl LiveRun {
                 // The execution that ended has published all it will; what
                 // this stream has not forwarded yet goes out before it moves on.
                 if !self.flush(inner, last_generation, out).await {
-                    return Ok(());
+                    return Ok(false);
                 }
                 *inner = Some(subscription_stream(
                     receiver,
@@ -1062,6 +1077,6 @@ impl LiveRun {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }

@@ -49,6 +49,12 @@ impl AgentExecutor for Agent {
                 Some("burst") => {
                     for i in 0..45 {
                         yield Ok(status(&t, &c, TaskState::Working, &format!("w{i}")));
+                        if i == 0 {
+                            // The session is following by now: the rest is a
+                            // burst it keeps up with, not one that overruns the
+                            // execution's buffer before it first polls.
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
                     }
                     yield Ok(status(&t, &c, TaskState::InputRequired, "end of burst"));
                 }

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use async_trait::async_trait;
-use futures::{StreamExt, stream::BoxStream};
+use futures::{FutureExt, StreamExt, stream::BoxStream};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Notify, RwLock, broadcast, mpsc, oneshot};
@@ -1005,7 +1005,9 @@ async fn drive_execution(
     active: Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
 ) {
-    let mut stream = runtime.executor.execute(exec_ctx);
+    let mut stream = runtime.executor.execute(exec_ctx).peekable();
+    // Set once the turn has been closed ahead of the push of its last event.
+    let mut finished = false;
 
     while let Some(result) = stream.next().await {
         if active.snapshot_is_terminal().await {
@@ -1060,6 +1062,19 @@ async fn drive_execution(
                 if !published {
                     continue;
                 }
+                // A webhook can take a while. If the executor has nothing more
+                // to say, the turn is closed first: the queue stops taking
+                // input and the execution is released, so a client that answers
+                // at once starts the next turn instead of being turned away.
+                if matches!(
+                    std::pin::Pin::new(&mut stream).peek().now_or_never(),
+                    Some(None)
+                ) {
+                    reject_unread_inputs(&active, &task_id).await;
+                    runtime.execution_manager.finish(&task_id, &active).await;
+                    runtime.task_changed.notify_waiters();
+                    finished = true;
+                }
                 if let Err(error) = send_push_notifications(
                     &task_id,
                     runtime.push_config_store.as_deref(),
@@ -1082,9 +1097,11 @@ async fn drive_execution(
         }
     }
 
-    reject_unread_inputs(&active, &task_id).await;
-    runtime.execution_manager.finish(&task_id, &active).await;
-    runtime.task_changed.notify_waiters();
+    if !finished {
+        reject_unread_inputs(&active, &task_id).await;
+        runtime.execution_manager.finish(&task_id, &active).await;
+        runtime.task_changed.notify_waiters();
+    }
 }
 
 /// Closes the execution's live-input queue and tells the exchanges about each
