@@ -1,3 +1,6 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
+// SPDX-License-Identifier: Apache-2.0
 //! Push notifications of one task keep the order of the events they announce,
 //! across turns and for a cancel, while the last push of a turn is slow.
 use std::sync::Arc;

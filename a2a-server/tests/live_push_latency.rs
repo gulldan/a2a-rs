@@ -1,3 +1,6 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
+// SPDX-License-Identifier: Apache-2.0
 //! A client that answers at once, while the final push of the turn is still in
 //! flight, starts the next turn instead of being declined.
 use std::time::Duration;

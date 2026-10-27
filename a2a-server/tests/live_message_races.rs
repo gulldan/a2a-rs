@@ -1,3 +1,6 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
+// SPDX-License-Identifier: Apache-2.0
 //! Races and failures around `SendLiveMessage` sessions: events of a finished
 //! turn, a panic mid-call, a call from another client, a message at turn end.
 use std::sync::Arc;
