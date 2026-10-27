@@ -452,7 +452,9 @@ fn an_artifact_only_request_is_a_fixed_point_of_the_json_conversion() {
             protojson_conv::from_value(protojson_conv::to_value(&once).unwrap()).unwrap();
         assert_eq!(once, twice, "{request:?}");
     }
+}
 
+#[test]
 fn a_stream_request_with_an_unknown_payload_is_kept_to_be_refused() {
     let unknown = a2a_pb::proto::StreamRequest {
         tenant: "acme".into(),
