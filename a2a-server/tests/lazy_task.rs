@@ -336,36 +336,40 @@ struct Typed;
 
 #[async_trait::async_trait]
 impl a2a_server::Agent for Typed {
-    async fn start(&self, ctx: ExecutorContext) -> Result<a2a_server::Start, A2AError> {
-        let text = ctx
-            .message
-            .as_ref()
-            .and_then(|m| m.text())
-            .unwrap_or("")
-            .to_string();
-        if text == "reply" {
+    async fn start(&self, msg: a2a_server::NewMessage) -> Result<a2a_server::Start, A2AError> {
+        if msg.message.text() == Some("reply") {
             return Ok(a2a_server::Start::Message(Message::new(
                 Role::Agent,
                 vec![Part::text("hi")],
             )));
         }
+        Ok(a2a_server::Start::Task(msg.new_task(TaskState::Working)))
+    }
+
+    fn execute(
+        &self,
+        mut ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let (task_id, context_id) = ctx.task_info();
-        Ok(a2a_server::Start::Task(
-            ctx.new_task(TaskState::Working),
-            a2a_server::TaskRun::new(move |inputs| {
-                async_stream::stream! {
-                    let Some(mut inputs) = inputs else { return };
-                    while let Some(input) = inputs.recv().await {
-                        let text = input.message.text().unwrap_or("").to_string();
-                        if text == "finish" {
-                            yield Ok(status(&task_id, &context_id, TaskState::Completed, "done"));
-                            return;
-                        }
-                        yield Ok(status(&task_id, &context_id, TaskState::Working, &format!("got: {text}")));
-                    }
+        let first = ctx.message.take();
+        let inputs = ctx.inputs.take();
+        Box::pin(async_stream::stream! {
+            // The task is there, whichever turn this is.
+            assert!(ctx.stored_task.is_some());
+            if let Some(first) = first {
+                let text = first.text().unwrap_or("").to_string();
+                yield Ok(status(&task_id, &context_id, TaskState::Working, &format!("got: {text}")));
+            }
+            let Some(mut inputs) = inputs else { return };
+            while let Some(input) = inputs.recv().await {
+                let text = input.message.text().unwrap_or("").to_string();
+                if text == "finish" {
+                    yield Ok(status(&task_id, &context_id, TaskState::Completed, "done"));
+                    return;
                 }
-            }),
-        ))
+                yield Ok(status(&task_id, &context_id, TaskState::Working, &format!("got: {text}")));
+            }
+        })
     }
 
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
@@ -426,16 +430,20 @@ async fn an_agent_that_starts_a_task_reads_the_clients_messages_from_then_on() {
         .await
         .unwrap();
     let _ = second.next().await; // the task, holding the message
-    let StreamResponse::StatusUpdate(update) = second.next().await.unwrap().unwrap() else {
-        panic!("a status update follows");
-    };
-    assert_eq!(
-        update
+    // The first turn may still be answering "hello".
+    loop {
+        let StreamResponse::StatusUpdate(update) = second.next().await.unwrap().unwrap() else {
+            panic!("a status update follows");
+        };
+        if update
             .status
             .message
-            .and_then(|m| m.text().map(str::to_owned)),
-        Some("got: ping".to_string())
-    );
+            .and_then(|m| m.text().map(str::to_owned))
+            == Some("got: ping".to_string())
+        {
+            break;
+        }
+    }
 }
 
 fn get_request(id: String) -> GetTaskRequest {
@@ -610,14 +618,10 @@ struct WrongId;
 
 #[async_trait::async_trait]
 impl a2a_server::Agent for WrongId {
-    async fn start(&self, ctx: ExecutorContext) -> Result<a2a_server::Start, A2AError> {
-        let mut task = ctx.new_task(TaskState::Working);
+    async fn start(&self, msg: a2a_server::NewMessage) -> Result<a2a_server::Start, A2AError> {
+        let mut task = msg.new_task(TaskState::Working);
         task.id = "other".into();
-        Ok(a2a_server::Start::Task(task, a2a_server::TaskRun::empty()))
-    }
-
-    fn cancel(&self, _: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-        Box::pin(stream::empty())
+        Ok(a2a_server::Start::Task(task))
     }
 }
 
@@ -628,5 +632,29 @@ async fn a_task_with_other_ids_than_the_executions_is_refused() {
         .send_message(&params(), send("hello"))
         .await
         .expect_err("the agent created a task for another id");
+    assert_eq!(tasks(&handler).await, 0);
+}
+
+struct OneShot;
+
+#[async_trait::async_trait]
+impl a2a_server::Agent for OneShot {
+    async fn start(&self, msg: a2a_server::NewMessage) -> Result<a2a_server::Start, A2AError> {
+        let text = msg.message.text().unwrap_or("").to_string();
+        Ok(a2a_server::Start::Message(Message::new(
+            Role::Agent,
+            vec![Part::text(format!("echo: {text}"))],
+        )))
+    }
+}
+
+#[tokio::test]
+async fn an_agent_that_only_starts_answers_every_message_and_keeps_no_tasks() {
+    let handler = DefaultRequestHandler::from_agent(OneShot, InMemoryTaskStore::new());
+    let response = handler.send_message(&params(), send("hi")).await.unwrap();
+    let SendMessageResponse::Message(reply) = response else {
+        panic!("a reply");
+    };
+    assert_eq!(reply.text(), Some("echo: hi"));
     assert_eq!(tasks(&handler).await, 0);
 }

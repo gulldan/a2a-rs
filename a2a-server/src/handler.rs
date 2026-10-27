@@ -2459,6 +2459,7 @@ impl DefaultRequestHandler {
             service_params: params.clone(),
             tenant: req.tenant,
             inputs,
+            new_task: !existed,
         };
 
         let runtime = ExecutionRuntime {
@@ -2771,6 +2772,7 @@ impl RequestHandler for DefaultRequestHandler {
             service_params: params.clone(),
             tenant: req.tenant,
             inputs: None,
+            new_task: false,
         };
         // A store that advanced the generation recorded the transition itself.
         let recorded_by_store = task.generation > generation_before;
