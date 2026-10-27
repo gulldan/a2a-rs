@@ -662,11 +662,9 @@ impl DefaultRequestHandler {
                 message_generation,
             ));
         }
-        drop(writer);
-        self.task_changed.notify_waiters();
-
         // The webhooks are called in the background, in order, so a slow
-        // receiver does not hold up the session that took the message.
+        // receiver does not hold up the session that took the message. Their
+        // place in line is taken here, before the executor can answer.
         spawn_push_notifications(
             &self.execution_manager,
             task_id,
@@ -675,6 +673,9 @@ impl DefaultRequestHandler {
             events,
         )
         .await;
+        drop(writer);
+        self.task_changed.notify_waiters();
+
         Ok(Some(Delivery::Injected {
             task,
             receiver,

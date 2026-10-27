@@ -78,6 +78,18 @@ impl AgentExecutor for LiveAgent {
                     yield Ok(status(&task, &context, TaskState::Completed, "done"));
                     return;
                 }
+                Some("chat") => {
+                    // Answers each input by asking for the next, and keeps the
+                    // turn open to read it.
+                    yield Ok(status(&task, &context, TaskState::Working, "working"));
+                    if let Some(mut inputs) = ctx.inputs.take() {
+                        while let Some(input) = inputs.recv().await {
+                            let text = input.message.text().unwrap_or("").to_string();
+                            yield Ok(status(&task, &context, TaskState::InputRequired, &format!("reply: {text}")));
+                        }
+                    }
+                    return;
+                }
                 Some("lazy-err") => {
                     // Like "lazy", but the turn ends with an error.
                     let _inputs = ctx.inputs.take();
@@ -1018,7 +1030,7 @@ async fn a_push_configuration_sent_with_a_message_to_a_running_task_is_registere
         r.configuration = Some(SendMessageConfiguration {
             accepted_output_modes: None,
             task_push_notification_config: Some(TaskPushNotificationConfig {
-                url: "https://example.com/hook".into(),
+                url: "http://127.0.0.1:9/hook".into(),
                 id: Some("hook-1".into()),
                 task_id: String::new(),
                 token: None,
@@ -1051,7 +1063,7 @@ async fn a_push_configuration_sent_with_a_message_to_a_running_task_is_registere
         .await
         .unwrap();
     assert_eq!(configs.configs.len(), 1);
-    assert_eq!(configs.configs[0].url, "https://example.com/hook");
+    assert_eq!(configs.configs[0].url, "http://127.0.0.1:9/hook");
 }
 
 #[tokio::test]
@@ -1653,11 +1665,10 @@ async fn a_streaming_message_to_a_working_task_reaches_the_agent() {
         .send_streaming_message(&p, message_request("hello", &task_id))
         .await
         .unwrap();
-    assert_eq!(task_of(next(&mut second).await).id, task_id);
-    assert!(matches!(
-        next(&mut second).await,
-        StreamResponse::MessageUpdate(_)
-    ));
+    // The opening task already holds the message: it is not announced again.
+    let opening = task_of(next(&mut second).await);
+    assert_eq!(opening.id, task_id);
+    assert_eq!(applied(&opening, "hello"), 1);
     assert_eq!(state_text(&next(&mut second).await).1, "got: hello");
     // The stream that started the turn hears it too.
     assert!(matches!(
@@ -1743,4 +1754,136 @@ async fn an_agent_that_takes_no_input_leaves_a_working_task_busy_for_unary_calls
         .await
         .unwrap();
     assert_eq!(applied(&stored, "hello"), 0);
+}
+
+#[tokio::test]
+async fn a_call_that_returns_at_once_does_not_wait_for_an_agent_that_ignores_input() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let mut stream = match send("lazy", None).payload {
+        StreamRequestPayload::SendMessage(request) => {
+            handler.send_streaming_message(&p, request).await.unwrap()
+        }
+        _ => unreachable!(),
+    };
+    let task_id = task_of(next(&mut stream).await).id;
+    assert_eq!(state_text(&next(&mut stream).await).1, "lazy");
+
+    let mut request = message_request("hello", &task_id);
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: None,
+        history_length: None,
+        timeline_length: None,
+        return_immediately: Some(true),
+        if_generation_match: None,
+    });
+    let response = tokio::time::timeout(Duration::from_secs(2), handler.send_message(&p, request))
+        .await
+        .expect("returns at once")
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(applied(&task, "hello"), 1);
+}
+
+#[tokio::test]
+async fn a_blocking_call_returns_when_the_turn_it_joined_asks_for_input() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let mut stream = match send("chat", None).payload {
+        StreamRequestPayload::SendMessage(request) => {
+            handler.send_streaming_message(&p, request).await.unwrap()
+        }
+        _ => unreachable!(),
+    };
+    let task_id = task_of(next(&mut stream).await).id;
+    assert_eq!(state_text(&next(&mut stream).await).1, "working");
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.send_message(&p, message_request("hello", &task_id)),
+    )
+    .await
+    .expect("returns at the interrupted state, though the turn goes on")
+    .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(task.status.state, TaskState::InputRequired);
+    assert_eq!(applied(&task, "hello"), 1);
+}
+
+/// A webhook that takes the connection and never answers.
+async fn silent_webhook() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            held.push(socket);
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn a_receiver_that_never_answers_does_not_hold_up_the_messages_of_a_working_task() {
+    let url = silent_webhook().await;
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            LiveAgent {
+                takes_input: true,
+                release: Arc::new(Notify::new()),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            push_notifications: Some(true),
+            ..AgentCapabilities::default()
+        })
+        .with_push_notifications(
+            a2a_server::InMemoryPushConfigStore::new(),
+            a2a_server::HttpPushSender::new(Some(a2a_server::HttpPushSenderConfig {
+                validate_urls: false,
+                ..Default::default()
+            })),
+        ),
+    );
+    let p = params("1.1");
+    let (task_id, _first) = working_task(&handler, &p).await;
+
+    let mut request = message_request("one", &task_id);
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: Some(TaskPushNotificationConfig {
+            url,
+            id: Some("silent".into()),
+            task_id: String::new(),
+            token: None,
+            authentication: None,
+            tenant: None,
+            protocol_version: None,
+        }),
+        history_length: None,
+        timeline_length: None,
+        return_immediately: Some(true),
+        if_generation_match: None,
+    });
+    let first = tokio::time::timeout(Duration::from_secs(2), handler.send_message(&p, request))
+        .await
+        .expect("the call does not wait for the webhook");
+    first.unwrap();
+    let mut second = tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.send_streaming_message(&p, message_request("two", &task_id)),
+    )
+    .await
+    .expect("nor does the next one")
+    .unwrap();
+    // The call that took the message answered at once, with the task holding it.
+    assert_eq!(applied(&task_of(next(&mut second).await), "two"), 1);
 }

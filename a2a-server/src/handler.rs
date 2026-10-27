@@ -450,11 +450,13 @@ fn should_interrupt_non_streaming(
         };
     }
 
+    // An interrupted state ends a blocking call (A2A §3.1.1): the turn may
+    // stay open to take more input, so the stream ending is not what to wait for.
+    let interrupted =
+        |state: &TaskState| matches!(state, TaskState::AuthRequired | TaskState::InputRequired);
     match event {
-        StreamResponse::Task(task) if task.status.state == TaskState::AuthRequired => {
-            Some(task.id.clone())
-        }
-        StreamResponse::StatusUpdate(update) if update.status.state == TaskState::AuthRequired => {
+        StreamResponse::Task(task) if interrupted(&task.status.state) => Some(task.id.clone()),
+        StreamResponse::StatusUpdate(update) if interrupted(&update.status.state) => {
             Some(update.task_id.clone())
         }
         _ => None,
@@ -2359,11 +2361,24 @@ impl RequestHandler for DefaultRequestHandler {
             // The task is running and its executor took the message: the call
             // waits for the turn it joined, as it would for one it started.
             live::Delivery::Injected {
-                task,
+                mut task,
                 receiver,
                 sequence_before,
                 ..
-            } => (task.id, receiver, sequence_before),
+            } => {
+                // Nothing of the running turn is awaited for a call that only
+                // wants the task: it is returned as the message left it.
+                if req
+                    .configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.return_immediately)
+                    .unwrap_or(false)
+                {
+                    apply_lengths(&mut task, history_length, timeline_length);
+                    return Ok(SendMessageResponse::Task(task));
+                }
+                (task.id, receiver, sequence_before)
+            }
         };
         // Unlike a client-facing stream this one keeps the executor's no-op
         // snapshots: the blocking send only needs to know the executor spoke.
@@ -2424,12 +2439,14 @@ impl RequestHandler for DefaultRequestHandler {
             .map_err(|rejection| unary_refusal(rejection, &req))?
         {
             live::Delivery::Started { task, receiver, .. } => (task, receiver, 0),
+            // The opening task already holds the message and its artifacts, so
+            // the stream follows from after them.
             live::Delivery::Injected {
                 task,
                 receiver,
-                sequence_before,
+                sequence_after,
                 ..
-            } => (task, receiver, sequence_before),
+            } => (task, receiver, sequence_after),
         };
         Ok(with_opening_task(
             subscription_stream(

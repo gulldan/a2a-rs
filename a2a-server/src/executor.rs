@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::middleware::{ServiceParams, User};
 
-/// A client message that reached a running execution on a live stream
-/// (`SendLiveMessage`).
+/// A client message that reached a running execution: sent on a live stream
+/// (`SendLiveMessage`) or with `SendMessage` or `SendStreamingMessage` to a
+/// task that is working.
 ///
 /// By the time an executor reads it the server has already appended it to the
 /// task's timeline and announced it to the subscribers; the executor decides
@@ -35,8 +36,8 @@ impl ClientInput {
     }
 }
 
-/// The client messages that arrive while an execution runs, from a live stream
-/// (see [`ExecutorContext::inputs`]).
+/// The client messages that arrive while an execution runs, on a live stream
+/// or sent to the working task (see [`ExecutorContext::inputs`]).
 ///
 /// The server owns the queue behind it: a message that is still unread when
 /// the execution ends is not lost, the server answers its sender with a
@@ -254,8 +255,8 @@ pub struct ExecutorContext {
     pub service_params: ServiceParams,
     /// Optional tenant ID.
     pub tenant: Option<String>,
-    /// Client messages that arrive while this execution runs, from a live
-    /// stream. Present only when [`AgentExecutor::accepts_live_input`] is true;
+    /// Client messages that arrive while this execution runs, on a live stream
+    /// or sent to the working task. Present only when [`AgentExecutor::accepts_live_input`] is true;
     /// the executor reads it alongside its own work, and it ends when the
     /// execution does.
     pub inputs: Option<ClientInputs>,
@@ -335,10 +336,15 @@ pub trait AgentExecutor: Send + Sync + 'static {
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 
     /// Whether this executor reads [`ExecutorContext::inputs`]: client messages
-    /// sent on a live stream while it is working. Off by default, in which case
-    /// such a message is declined (a `StreamError`) while the execution runs,
-    /// which the protocol allows; it is accepted as a new turn once the task is
-    /// idle again.
+    /// sent while it is working, on a live stream or with `SendMessage` or
+    /// `SendStreamingMessage`. Off by default, in which case such a message is
+    /// declined while the execution runs (a `StreamError` on a live stream, a
+    /// busy error on the other calls), which the protocol allows; it is
+    /// accepted as a new turn once the task is idle again.
+    ///
+    /// A blocking `SendMessage` that joins a running turn waits for it to end,
+    /// or to reach an interrupted state; an executor that keeps a turn open
+    /// without ever interrupting it holds such a call open.
     fn accepts_live_input(&self) -> bool {
         false
     }
