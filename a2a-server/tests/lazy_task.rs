@@ -62,6 +62,49 @@ impl AgentExecutor for Agent {
                     tokio::time::sleep(Duration::from_millis(600)).await;
                     yield Ok(status(&task, &context, TaskState::Working, "too late"));
                 }
+                "slow-reply" => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    yield Ok(StreamResponse::Message(Message::new(
+                        Role::Agent,
+                        vec![Part::text("hi")],
+                    )));
+                }
+                "panic" => {
+                    if text == "panic" {
+                        panic!("the executor panicked");
+                    }
+                }
+                "reply-then-panic" => {
+                    yield Ok(StreamResponse::Message(Message::new(
+                        Role::Agent,
+                        vec![Part::text("hi")],
+                    )));
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    panic!("the executor panicked");
+                }
+                "artifact" => {
+                    yield Ok(StreamResponse::ArtifactUpdate(
+                        a2a::event::TaskArtifactUpdateEvent {
+                            task_id: task.clone(),
+                            context_id: context.clone(),
+                            artifact: Artifact {
+                                artifact_id: "a1".into(),
+                                name: None,
+                                description: None,
+                                parts: vec![Part::text("x")],
+                                metadata: None,
+                                extensions: None,
+                                start_generation: None,
+                                end_generation: None,
+                                role: None,
+                            },
+                            append: None,
+                            last_chunk: Some(true),
+                            metadata: None,
+                            generation: 0,
+                        },
+                    ));
+                }
                 "silent" => {}
                 "error" => {
                     yield Err(A2AError::internal("no"));
@@ -393,4 +436,197 @@ async fn an_agent_that_starts_a_task_reads_the_clients_messages_from_then_on() {
             .and_then(|m| m.text().map(str::to_owned)),
         Some("got: ping".to_string())
     );
+}
+
+fn get_request(id: String) -> GetTaskRequest {
+    GetTaskRequest {
+        id,
+        history_length: None,
+        tenant: None,
+        timeline_length: None,
+        current_generation: None,
+    }
+}
+
+#[tokio::test]
+async fn a_panic_before_the_first_event_leaves_no_task() {
+    let (handler, _) = handler();
+    // The executor panics before saying anything: the call fails, and there is
+    // no task to have failed.
+    let result = handler.send_message(&params(), send("panic")).await;
+    assert!(
+        !matches!(result, Ok(SendMessageResponse::Task(_))),
+        "{result:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(tasks(&handler).await, 0);
+}
+
+#[tokio::test]
+async fn a_panic_after_a_direct_reply_creates_no_task() {
+    let (handler, _) = handler();
+    let response = handler
+        .send_message(&params(), send("reply-then-panic"))
+        .await
+        .unwrap();
+    assert!(matches!(response, SendMessageResponse::Message(_)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(tasks(&handler).await, 0);
+}
+
+fn with_push_config(mut request: SendMessageRequest) -> SendMessageRequest {
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: Some(TaskPushNotificationConfig {
+            url: "http://127.0.0.1:9/hook".into(),
+            id: Some("hook".into()),
+            task_id: String::new(),
+            token: None,
+            authentication: None,
+            tenant: None,
+            protocol_version: None,
+        }),
+        history_length: None,
+        timeline_length: None,
+        return_immediately: None,
+        if_generation_match: None,
+    });
+    request
+}
+
+fn push_handler() -> (Arc<DefaultRequestHandler>, Arc<Mutex<Vec<String>>>) {
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let handler = DefaultRequestHandler::new(Agent { ids: ids.clone() }, InMemoryTaskStore::new())
+        .with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            push_notifications: Some(true),
+            ..AgentCapabilities::default()
+        })
+        .with_push_config_store(a2a_server::InMemoryPushConfigStore::new());
+    (Arc::new(handler), ids)
+}
+
+async fn push_configs(handler: &DefaultRequestHandler, task_id: &str) -> usize {
+    handler
+        .list_push_configs(
+            &params(),
+            ListTaskPushNotificationConfigsRequest {
+                task_id: task_id.into(),
+                page_size: None,
+                page_token: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap()
+        .configs
+        .len()
+}
+
+#[tokio::test]
+async fn a_push_configuration_is_kept_only_for_a_task_that_exists() {
+    let (handler, ids) = push_handler();
+
+    // A direct reply, an early error: no task, so no configuration.
+    for text in ["reply", "error"] {
+        let _ = handler
+            .send_message(&params(), with_push_config(send(text)))
+            .await;
+        let id = ids.lock().unwrap().last().unwrap().clone();
+        assert_eq!(push_configs(&handler, &id).await, 0, "{text}");
+    }
+
+    // A task the executor creates keeps the one the request carried.
+    let response = handler
+        .send_message(&params(), with_push_config(send("task")))
+        .await
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(push_configs(&handler, &task.id).await, 1);
+}
+
+#[tokio::test]
+async fn a_task_the_executor_has_not_created_yet_is_not_found() {
+    let (handler, ids) = handler();
+    let call = {
+        let handler = handler.clone();
+        tokio::spawn(async move { handler.send_message(&params(), send("slow-reply")).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let id = ids.lock().unwrap()[0].clone();
+    for result in [
+        handler
+            .get_task(&params(), get_request(id.clone()))
+            .await
+            .map(|_| ()),
+        handler
+            .cancel_task(
+                &params(),
+                CancelTaskRequest {
+                    id: id.clone(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .map(|_| ()),
+        handler
+            .subscribe_to_task(
+                &params(),
+                SubscribeToTaskRequest {
+                    id: id.clone(),
+                    tenant: None,
+                    last_seen_generation: None,
+                },
+            )
+            .await
+            .map(|_| ()),
+    ] {
+        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_FOUND);
+    }
+    assert!(matches!(
+        call.await.unwrap().unwrap(),
+        SendMessageResponse::Message(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_first_artifact_event_creates_the_task() {
+    let (handler, _) = handler();
+    let response = handler
+        .send_message(&params(), send("artifact"))
+        .await
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(task.artifacts.as_ref().map(Vec::len), Some(1));
+    assert_eq!(tasks(&handler).await, 1);
+}
+
+struct WrongId;
+
+#[async_trait::async_trait]
+impl a2a_server::Agent for WrongId {
+    async fn start(&self, ctx: ExecutorContext) -> Result<a2a_server::Start, A2AError> {
+        let mut task = ctx.new_task(TaskState::Working);
+        task.id = "other".into();
+        Ok(a2a_server::Start::Task(task, a2a_server::TaskRun::empty()))
+    }
+
+    fn cancel(&self, _: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(stream::empty())
+    }
+}
+
+#[tokio::test]
+async fn a_task_with_other_ids_than_the_executions_is_refused() {
+    let handler = DefaultRequestHandler::from_agent(WrongId, InMemoryTaskStore::new());
+    handler
+        .send_message(&params(), send("hello"))
+        .await
+        .expect_err("the agent created a task for another id");
+    assert_eq!(tasks(&handler).await, 0);
 }

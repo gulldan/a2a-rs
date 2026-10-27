@@ -544,11 +544,11 @@ impl DefaultRequestHandler {
         let Some(active) = self.execution_manager.get(task_id).await else {
             return Ok(None);
         };
+        let writer = active.writer.lock().await;
         // A task the executor has not created yet is not one a client can know.
         if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(None);
         }
-        let writer = active.writer.lock().await;
         // The execution may have ended, or the request preparing it failed,
         // while this waited for the lock.
         let registered = self
@@ -703,6 +703,12 @@ impl DefaultRequestHandler {
         // request failed and released the task, falls through to the checks
         // below. The wait follows the lookup that found the execution, not one
         // before it: a registration made in between is waited for too.
+        // A task the executor has not created yet is not one a client can know.
+        if let Some(active) = self.execution_manager.get(&req.id).await {
+            if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(A2AError::task_not_found(&req.id));
+            }
+        }
         let mut resubscribed = self.execution_manager.resubscribe(&req.id).await;
         if matches!(resubscribed, Some((_, None, _))) {
             resubscribed = match self.execution_manager.get(&req.id).await {

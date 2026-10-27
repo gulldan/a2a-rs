@@ -243,7 +243,9 @@ pub struct ExecutorContext {
     pub message: Option<Message>,
     /// The task ID being executed.
     pub task_id: TaskId,
-    /// The existing task, if this is a continuation.
+    /// The existing task, if this is a continuation. For a new task it is
+    /// `None`, except on a blocking `SendMessage`, where it is the task as the
+    /// request prepared it (not saved yet: the executor's first event creates it).
     pub stored_task: Option<Task>,
     /// Context ID grouping related interactions.
     pub context_id: String,
@@ -350,9 +352,11 @@ impl ExecutorContext {
 /// a task, status or artifact event creates it, and the server saves it then;
 /// a [`Message`] is a direct reply, nothing is saved, and whatever the
 /// executor emits afterwards is ignored (it may keep working until it
-/// returns). An executor that fails or ends without an event before that
-/// leaves no task, or the task as the request prepared it, respectively. See
-/// [`Agent`] for the same contract as a typed return value.
+/// returns). An executor that fails or panics before it has said anything
+/// leaves no task; one that ends without an event leaves the task as the
+/// request prepared it. Opening a live exchange is the exception: that task
+/// is created up front. See [`Agent`] for the same contract as a typed return
+/// value.
 #[async_trait::async_trait]
 pub trait AgentExecutor: Send + Sync + 'static {
     /// Execute a message. Returns a stream of events.
@@ -416,8 +420,8 @@ impl TaskRun {
         }
     }
 
-    /// No further events: the task stays as it was created.
-    pub fn finished() -> Self {
+    /// No events after the task is created: it stays as it was created.
+    pub fn empty() -> Self {
         TaskRun::new(|_| futures::stream::empty())
     }
 
@@ -433,6 +437,8 @@ impl TaskRun {
 ///
 /// The server creates and saves a task only when [`Agent::start`] returns
 /// [`Start::Task`], and queues the client's messages for it only from then on.
+/// (A live exchange is bound to its task from its first request, so that one
+/// is created up front, and a reply to it does not end the exchange.)
 /// [`AgentExecutor`] is the same contract as a stream of events, whose first
 /// event decides; it runs on the server unchanged.
 #[async_trait::async_trait]
@@ -462,6 +468,7 @@ impl<A: Agent> AgentExecutor for AgentExecutorAdapter<A> {
         use futures::StreamExt;
 
         let agent = Arc::clone(&self.0);
+        let (task_id, context_id) = ctx.task_info();
         Box::pin(
             futures::stream::once(async move {
                 let inputs = ctx.inputs.take();
@@ -471,9 +478,19 @@ impl<A: Agent> AgentExecutor for AgentExecutorAdapter<A> {
                         futures::stream::once(async move { Ok(StreamResponse::Message(message)) })
                             .boxed()
                     }
+                    // The task is the one this execution is for.
+                    Ok(Start::Task(task, _))
+                        if task.id != task_id || task.context_id != context_id =>
+                    {
+                        futures::stream::once(
+                            async move { Err(A2AError::invalid_agent_response()) },
+                        )
+                        .boxed()
+                    }
                     Ok(Start::Task(task, run)) => {
                         futures::stream::once(async move { Ok(StreamResponse::Task(task)) })
-                            .chain(run.run(inputs))
+                            // The work starts once the task has been created.
+                            .chain(futures::stream::once(async move { run.run(inputs) }).flatten())
                             .boxed()
                     }
                 }

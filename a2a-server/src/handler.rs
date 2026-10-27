@@ -87,6 +87,8 @@ struct ActiveExecution {
     /// task is created by the executor's first event, and does not exist if
     /// the executor answers with a message alone.
     uncreated: std::sync::atomic::AtomicBool,
+    /// The push configuration the request carried, kept until the task exists.
+    pending_push: std::sync::Mutex<Option<TaskPushNotificationConfig>>,
 }
 
 impl ActiveExecution {
@@ -106,6 +108,7 @@ impl ActiveExecution {
             writer,
             inputs: std::sync::OnceLock::new(),
             uncreated: std::sync::atomic::AtomicBool::new(false),
+            pending_push: std::sync::Mutex::new(None),
         })
     }
 
@@ -561,13 +564,27 @@ async fn deliver_push_notifications(
     Ok(())
 }
 
-async fn save_task(task_store: &dyn crate::TaskStore, mut task: Task) -> Result<Task, A2AError> {
+async fn save_task(task_store: &dyn crate::TaskStore, task: Task) -> Result<Task, A2AError> {
+    save_task_with(task_store, task, false).await
+}
+
+/// Saves `task`: `creating` for the first save of a task, which is created
+/// outright; otherwise it is updated, and created if the store does not know it.
+async fn save_task_with(
+    task_store: &dyn crate::TaskStore,
+    mut task: Task,
+    creating: bool,
+) -> Result<Task, A2AError> {
     // DM-SERIAL-001: a persisted/returned task status must carry a timestamp.
     // This is the single persistence chokepoint for executor events, so
     // backfilling here covers the task-snapshot and status-update paths
     // alike, while preserving any timestamp the executor already supplied.
     if task.status.timestamp.is_none() {
         task.status.timestamp = Some(chrono::Utc::now());
+    }
+    if creating {
+        task_store.create(task.clone()).await?;
+        return Ok(task);
     }
     match task_store.update(task.clone()).await {
         Ok(_) => Ok(task),
@@ -928,6 +945,17 @@ async fn apply_event_to_task(
     current_task: Option<Task>,
     event: &mut StreamResponse,
 ) -> Result<Option<Task>, A2AError> {
+    apply_event_to_new_or_stored_task(task_store, current_task, event, false).await
+}
+
+/// [`apply_event_to_task`], where `creating` says the event is the first of a
+/// task that is not in the store yet.
+async fn apply_event_to_new_or_stored_task(
+    task_store: &dyn crate::TaskStore,
+    current_task: Option<Task>,
+    event: &mut StreamResponse,
+    creating: bool,
+) -> Result<Option<Task>, A2AError> {
     match event {
         StreamResponse::Task(task) => {
             let previous = match current_task {
@@ -948,7 +976,9 @@ async fn apply_event_to_task(
                     }
                 }
             }
-            save_task(task_store, task.clone()).await.map(Some)
+            save_task_with(task_store, task.clone(), creating)
+                .await
+                .map(Some)
         }
         StreamResponse::StatusUpdate(update) => {
             let mut task = match current_task {
@@ -963,7 +993,7 @@ async fn apply_event_to_task(
             if task.status.state.is_terminal() {
                 close_open_artifacts(&mut task, update.generation);
             }
-            save_task(task_store, task).await.map(Some)
+            save_task_with(task_store, task, creating).await.map(Some)
         }
         StreamResponse::ArtifactUpdate(update) => {
             let mut task = match current_task {
@@ -974,7 +1004,7 @@ async fn apply_event_to_task(
                     .ok_or_else(|| A2AError::task_not_found(&update.task_id))?,
             };
             update.generation = merge_artifact(&mut task, update)?;
-            save_task(task_store, task).await.map(Some)
+            save_task_with(task_store, task, creating).await.map(Some)
         }
         // A message appended to the task, and a rejection of a client request,
         // are what the server reports about *clients*. An executor has no
@@ -1001,8 +1031,20 @@ async fn apply_and_publish(
     base: Option<Task>,
     event: &mut StreamResponse,
 ) -> Result<bool, A2AError> {
+    apply_and_publish_with(task_store, active, base, event, false).await
+}
+
+/// [`apply_and_publish`], where `creating` says the event is the first of a
+/// task that is not in the store yet.
+async fn apply_and_publish_with(
+    task_store: &dyn crate::TaskStore,
+    active: &ActiveExecution,
+    base: Option<Task>,
+    event: &mut StreamResponse,
+    creating: bool,
+) -> Result<bool, A2AError> {
     let generation_before = base.as_ref().map(|task| task.generation);
-    let updated_task = apply_event_to_task(task_store, base, event).await?;
+    let updated_task = apply_event_to_new_or_stored_task(task_store, base, event, creating).await?;
     let repeated = matches!(
         &*event,
         StreamResponse::Task(task) if Some(task.generation) == generation_before
@@ -1153,15 +1195,28 @@ async fn drive_execution(
                         if is_terminal_event(&event) {
                             reject_unread_inputs_locked(&active, &task_id).await;
                         }
-                        match apply_and_publish(
+                        // The executor's first event creates a new task.
+                        let creating = active.uncreated.load(std::sync::atomic::Ordering::SeqCst);
+                        let applied = apply_and_publish_with(
                             runtime.task_store.as_ref(),
                             &active,
                             base,
                             &mut event,
+                            creating,
                         )
-                        .await
-                        {
+                        .await;
+                        // Whatever the first event was, the executor has spoken:
+                        // the task exists, or the event was refused and there is
+                        // none. Cleared with the writer held, so a follow-up
+                        // that finds the task finds it created.
+                        active
+                            .uncreated
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        match applied {
                             Ok(published) => {
+                                if creating {
+                                    save_pending_push_config(&active, &runtime).await;
+                                }
                                 runtime.task_changed.notify_waiters();
                                 Some(published)
                             }
@@ -1173,11 +1228,6 @@ async fn drive_execution(
                         }
                     }
                 };
-                // Whatever the first event was, the executor has spoken: the task
-                // exists, or the event was refused and there is none.
-                active
-                    .uncreated
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 let Some(published) = published else {
                     break;
                 };
@@ -1274,14 +1324,32 @@ async fn drive_execution(
         {
             let _writer = active.writer.lock().await;
             if let Some(task) = active.snapshot().await {
-                if let Err(error) = save_task(runtime.task_store.as_ref(), task).await {
-                    tracing::warn!(task_id = %task_id, %error, "could not create the task");
+                match save_task_with(runtime.task_store.as_ref(), task, true).await {
+                    Ok(_) => save_pending_push_config(&active, &runtime).await,
+                    Err(error) => {
+                        tracing::warn!(task_id = %task_id, %error, "could not create the task");
+                    }
                 }
             }
         }
         reject_unread_inputs(&active, &task_id).await;
         runtime.execution_manager.finish(&task_id, &active).await;
         runtime.task_changed.notify_waiters();
+    }
+}
+
+/// Saves the push configuration the request that started the execution
+/// carried, now that the task it is for exists.
+async fn save_pending_push_config(active: &ActiveExecution, runtime: &ExecutionRuntime) {
+    let pending = active
+        .pending_push
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let (Some(config), Some(store)) = (pending, runtime.push_config_store.as_ref()) {
+        if let Err(error) = store.save(config).await {
+            tracing::warn!(%error, "could not save the push configuration of a new task");
+        }
     }
 }
 
@@ -1368,7 +1436,17 @@ async fn drive_execution_guarded(
     let mut failed_event = None;
     {
         let _writer = active.writer.lock().await;
-        if let Some(base) = active.snapshot().await {
+        // A task the executor never created, or answered with a message alone,
+        // stays uncreated: the panic is reported on the streams, and there is
+        // no task to fail.
+        if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
+            active
+                .publish(
+                    Err(&A2AError::internal("the agent failed unexpectedly")),
+                    None,
+                )
+                .await;
+        } else if let Some(base) = active.snapshot().await {
             if !base.status.state.is_terminal() {
                 reject_unread_inputs_locked(&active, &task_id).await;
                 let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -1917,21 +1995,22 @@ impl DefaultRequestHandler {
         Ok((task, existed, context_id, events))
     }
 
-    async fn save_request_push_config(
+    /// The push configuration the request carries, for `task_id`.
+    fn request_push_config(
         &self,
         params: &ServiceParams,
         task_id: &str,
         req: &SendMessageRequest,
-    ) -> Result<(), A2AError> {
-        let Some(config) = req
+    ) -> Result<Option<TaskPushNotificationConfig>, A2AError> {
+        let Some(mut config) = req
             .configuration
             .as_ref()
             .and_then(|configuration| configuration.task_push_notification_config.clone())
         else {
-            return Ok(());
+            return Ok(None);
         };
-
-        let mut config = config;
+        // Refused up front when the handler has nowhere to keep it.
+        self.push_config_store_checked()?;
         config.task_id = task_id.to_string();
         if config.tenant.is_none() {
             config.tenant = req.tenant.clone();
@@ -1939,7 +2018,18 @@ impl DefaultRequestHandler {
         config
             .protocol_version
             .get_or_insert_with(|| requested_protocol_version(params));
-        self.push_config_store_checked()?.save(config).await?;
+        Ok(Some(config))
+    }
+
+    async fn save_request_push_config(
+        &self,
+        params: &ServiceParams,
+        task_id: &str,
+        req: &SendMessageRequest,
+    ) -> Result<(), A2AError> {
+        if let Some(config) = self.request_push_config(params, task_id, req)? {
+            self.push_config_store_checked()?.save(config).await?;
+        }
         Ok(())
     }
 
@@ -2305,8 +2395,18 @@ impl DefaultRequestHandler {
                 let prepared = self
                     .prepare_task_for_execution(&req, &task_id, lazy)
                     .await?;
-                self.save_request_push_config(params, &task_id, &req)
-                    .await?;
+                if lazy && !prepared.1 {
+                    // For a task that may never exist, the configuration waits
+                    // for the executor to create it.
+                    let config = self.request_push_config(params, &task_id, &req)?;
+                    *active
+                        .pending_push
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+                } else {
+                    self.save_request_push_config(params, &task_id, &req)
+                        .await?;
+                }
                 Ok::<_, A2AError>(prepared)
             }
             .await;
