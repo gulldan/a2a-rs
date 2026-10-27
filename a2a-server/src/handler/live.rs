@@ -25,6 +25,9 @@
 //!   (`EXECUTION_BUFFER_CAPACITY` events) faster than a session drains them
 //!   ends that exchange with an error, as it does a streaming subscription.
 //! - Without replay, `lastSeenGeneration` resumes from a snapshot.
+//! - A turn is closed ahead of the push of its last event only when the
+//!   executor's stream ends right after that event; an executor that awaits
+//!   something after its last yield keeps the input queue open for the push.
 
 use super::*;
 use crate::executor::{ClientInput, InputRefusal};
@@ -651,6 +654,7 @@ impl DefaultRequestHandler {
 
         for event in &events {
             if let Err(error) = send_push_notifications(
+                &self.execution_manager,
                 task_id,
                 self.push_config_store.as_deref(),
                 self.push_sender.as_deref(),

@@ -46,6 +46,14 @@ impl AgentExecutor for Agent {
         Box::pin(async_stream::stream! {
             let (t, c) = (ctx.task_id.clone(), ctx.context_id.clone());
             match first.as_deref() {
+                Some("overrun") => {
+                    // More than the execution's buffer holds, with nobody
+                    // draining it: a session that follows it falls behind.
+                    for i in 0..200 {
+                        yield Ok(status(&t, &c, TaskState::Working, &format!("w{i}")));
+                    }
+                    yield Ok(status(&t, &c, TaskState::InputRequired, "end of overrun"));
+                }
                 Some("burst") => {
                     for i in 0..45 {
                         yield Ok(status(&t, &c, TaskState::Working, &format!("w{i}")));
@@ -402,4 +410,47 @@ async fn p5_message_at_turn_end_is_not_declined() {
     let (a, _) = p5_run(true).await;
     let (b, _) = p5_run(false).await;
     assert_eq!(a + b, 0);
+}
+
+/// A session that fell behind the turn that just ended is told so and the
+/// exchange ends, whether it notices as it follows the turn or as the next
+/// message starts a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exchange_that_fell_behind_ends_when_the_next_turn_starts() {
+    for round in 0..30 {
+        let (h, _) = handler_with(true);
+        let p = params("1.1", "a");
+        let (up, rx) = mpsc::channel(8);
+        up.send(send("overrun", None)).await.unwrap();
+        let mut down: Downlink = h
+            .send_live_message(&p, ReceiverStream::new(rx).boxed())
+            .await
+            .unwrap();
+        let task = match next(&mut down).await {
+            StreamResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        };
+        loop {
+            if get(&h, &task.id).await.status.state == TaskState::InputRequired {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        up.send(send("ask", Some(&task.id))).await.unwrap();
+        // An error ends the downlink: nothing follows it.
+        let ended = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut failed = false;
+            while let Some(item) = down.next().await {
+                failed |= item.is_err();
+            }
+            failed
+        })
+        .await;
+        assert_eq!(
+            ended,
+            Ok(true),
+            "round {round}: the exchange went on after the error"
+        );
+    }
 }

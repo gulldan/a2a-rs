@@ -186,6 +186,10 @@ struct ExecutionManager {
     /// One writer lock per task, shared by whoever is mutating it. Held weakly
     /// so a task nobody is touching costs nothing.
     writers: std::sync::Mutex<TaskWriters>,
+    /// One lock per task that orders its push notifications: the last push of a
+    /// turn is still in flight when the next turn starts, and its webhook must
+    /// be called before the next turn's.
+    pushers: std::sync::Mutex<TaskWriters>,
 }
 
 #[derive(Default)]
@@ -199,8 +203,19 @@ impl ExecutionManager {
     /// events, a cancel, a follow-up being prepared. Two callers asking for the
     /// same task while either still holds it get the same lock.
     fn writer_for(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut writers = self
-            .writers
+        Self::lock_for(&self.writers, task_id)
+    }
+
+    /// The task's push-ordering lock.
+    fn push_lock_for(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Self::lock_for(&self.pushers, task_id)
+    }
+
+    fn lock_for(
+        locks: &std::sync::Mutex<TaskWriters>,
+        task_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut writers = locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         writers.calls += 1;
@@ -446,7 +461,23 @@ fn should_interrupt_non_streaming(
     }
 }
 
+/// Pushes `event` once the pushes of the task's earlier events are done.
 async fn send_push_notifications(
+    manager: &ExecutionManager,
+    task_id: &str,
+    push_config_store: Option<&dyn crate::PushConfigStore>,
+    push_sender: Option<&crate::HttpPushSender>,
+    event: &StreamResponse,
+) -> Result<(), A2AError> {
+    if push_config_store.is_none() || push_sender.is_none() {
+        return Ok(());
+    }
+    let _ordered = manager.push_lock_for(task_id).lock_owned().await;
+    deliver_push_notifications(task_id, push_config_store, push_sender, event).await
+}
+
+/// [`send_push_notifications`] for a caller that holds the task's push lock.
+async fn deliver_push_notifications(
     task_id: &str,
     push_config_store: Option<&dyn crate::PushConfigStore>,
     push_sender: Option<&crate::HttpPushSender>,
@@ -1065,17 +1096,56 @@ async fn drive_execution(
                 // A webhook can take a while. If the executor has nothing more
                 // to say, the turn is closed first: the queue stops taking
                 // input and the execution is released, so a client that answers
-                // at once starts the next turn instead of being turned away.
-                if matches!(
-                    std::pin::Pin::new(&mut stream).peek().now_or_never(),
-                    Some(None)
-                ) {
+                // at once starts the next turn instead of being turned away,
+                // and the streams of this execution end without waiting for the
+                // webhook. The push goes on in the background, ahead of the
+                // next turn's (the task's push lock is taken before the release).
+                if !is_terminal_event(&event)
+                    && matches!(
+                        std::pin::Pin::new(&mut stream).peek().now_or_never(),
+                        Some(None)
+                    )
+                {
+                    // Queued for the push lock now, without waiting for it:
+                    // the lock is handed out in order, so the next turn's
+                    // pushes come after this one's, and the turn is closed
+                    // below at once even if an earlier push is still running.
+                    let mut ordered = Box::pin(
+                        runtime
+                            .execution_manager
+                            .push_lock_for(&task_id)
+                            .lock_owned(),
+                    );
+                    let held = futures::poll!(ordered.as_mut());
                     reject_unread_inputs(&active, &task_id).await;
                     runtime.execution_manager.finish(&task_id, &active).await;
                     runtime.task_changed.notify_waiters();
                     finished = true;
+                    let (store, sender) = (
+                        runtime.push_config_store.clone(),
+                        runtime.push_sender.clone(),
+                    );
+                    let task_id = task_id.clone();
+                    tokio::spawn(async move {
+                        let _ordered = match held {
+                            std::task::Poll::Ready(guard) => guard,
+                            std::task::Poll::Pending => ordered.await,
+                        };
+                        if let Err(error) = deliver_push_notifications(
+                            &task_id,
+                            store.as_deref(),
+                            sender.as_deref(),
+                            &event,
+                        )
+                        .await
+                        {
+                            tracing::warn!(task_id = %task_id, %error, "could not push the last event of a turn");
+                        }
+                    });
+                    break;
                 }
                 if let Err(error) = send_push_notifications(
+                    &runtime.execution_manager,
                     &task_id,
                     runtime.push_config_store.as_deref(),
                     runtime.push_sender.as_deref(),
@@ -1215,6 +1285,7 @@ async fn drive_execution_guarded(
     reject_unread_inputs(&active, &task_id).await;
     if let Some(event) = failed_event {
         if let Err(error) = send_push_notifications(
+            &manager,
             &task_id,
             push_config_store.as_deref(),
             push_sender.as_deref(),
@@ -1795,6 +1866,7 @@ impl DefaultRequestHandler {
                 continue;
             }
             if let Err(error) = send_push_notifications(
+                &self.execution_manager,
                 task_id,
                 self.push_config_store.as_deref(),
                 self.push_sender.as_deref(),
@@ -1822,6 +1894,7 @@ impl DefaultRequestHandler {
         let pushed = match &recorded {
             Ok(Some(event)) => {
                 send_push_notifications(
+                    &self.execution_manager,
                     task_id,
                     self.push_config_store.as_deref(),
                     self.push_sender.as_deref(),
