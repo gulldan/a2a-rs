@@ -25,18 +25,12 @@
 //!   (`EXECUTION_BUFFER_CAPACITY` events) faster than a session drains them
 //!   ends that exchange with an error, as it does a streaming subscription.
 //! - Without replay, `lastSeenGeneration` resumes from a snapshot.
-//! - A push receiver that, before it answers a push, calls back into the task
-//!   (a follow-up message, a cancel) waits until the push times out: the
-//!   task's pushes are delivered one at a time, in order, and the follow-up's
-//!   first push queues behind the one still unanswered.
-//! - With `fail_on_error`, a failure to push the last event of a turn that
-//!   ends without a terminal state is logged, not reported to the stream.
-//! - Pushes of events published by different callers within one turn (a live
-//!   input and the executor's reply) are ordered as the callers reach the
-//!   push lock, which can differ from the order they were published in.
-//! - A turn is closed ahead of the push of its last event only when the
-//!   executor's stream ends right after that event; an executor that awaits
-//!   something after its last yield keeps the input queue open for the push.
+//! - Webhook deliveries are queued per task, in publish order, and never waited
+//!   for. A receiver that is down or slow delays only its own task's deliveries,
+//!   and when more than `PUSH_QUEUE_CAPACITY` are waiting the newest are dropped
+//!   (a client sees the gap in the generations and reads the task). With
+//!   `fail_on_error`, a failed delivery fails the execution at its next event,
+//!   not at the event it was for.
 
 use super::*;
 use crate::executor::{ClientInput, InputRefusal};
@@ -657,17 +651,17 @@ impl DefaultRequestHandler {
                 message_generation,
             ));
         }
-        // The webhooks are called in the background, in order, so a slow
-        // receiver does not hold up the session that took the message. Their
-        // place in line is taken here, before the executor can answer.
-        spawn_push_notifications(
-            &self.execution_manager,
-            task_id,
-            self.push_config_store.clone(),
-            self.push_sender.clone(),
-            events,
-        )
-        .await;
+        // The webhooks are queued under the writer, in publish order, and never
+        // waited for.
+        for event in &events {
+            self.execution_manager.pushes.push(
+                task_id,
+                0,
+                &self.push_config_store,
+                &self.push_sender,
+                event,
+            );
+        }
         drop(writer);
         self.task_changed.notify_waiters();
 

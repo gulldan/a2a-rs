@@ -205,8 +205,18 @@ async fn pushes_of_a_later_turn_and_a_cancel_wait_for_the_last_push_of_the_turn_
         )
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let order = order.lock().unwrap().clone();
+    // Deliveries are made one at a time: wait for all four, not for a while.
+    let order = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let seen = order.lock().unwrap().clone();
+            if seen.iter().filter(|s| s.starts_with("done:")).count() == 4 {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("all four deliveries are made: {:?}", order.lock().unwrap()));
     let arrivals: Vec<_> = order
         .iter()
         .filter(|s| s.starts_with("arrive:"))
@@ -218,4 +228,37 @@ async fn pushes_of_a_later_turn_and_a_cancel_wait_for_the_last_push_of_the_turn_
         "{order:?}"
     );
     assert_eq!(arrivals.len(), 4, "{order:?}");
+}
+
+/// A receiver that has not answered a push, for example because it is calling
+/// back into the task, does not hold up the task: its deliveries wait in their
+/// own queue while the executions go on, including the events they push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_that_has_not_answered_does_not_hold_up_the_next_turn() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<(String, tokio::sync::oneshot::Sender<()>)>();
+    let url = webhook(200, tx).await;
+    // Takes every push and answers none.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some(push) = rx.recv().await {
+            held.push(push);
+        }
+    });
+    let h = handler(Duration::from_secs(30), false);
+    let first = h
+        .send_message(&params(), req("one", None, Some(&url)))
+        .await
+        .unwrap();
+    let SendMessageResponse::Task(task) = first else {
+        panic!("a task is returned");
+    };
+    // Turn two pushes a status and then its reply; neither waits for the
+    // receiver, which is still holding turn one's.
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        h.send_message(&params(), req("two", Some(&task.id), None)),
+    )
+    .await
+    .expect("the next turn waited for the receiver")
+    .unwrap();
 }

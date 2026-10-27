@@ -70,6 +70,12 @@ impl AgentExecutor for LiveAgent {
                     yield Ok(status(&task, &context, TaskState::InputRequired, &format!("user: {who}")));
                     return;
                 }
+                Some("ask-slow") => {
+                    // Asks for input, then takes a moment to return.
+                    yield Ok(status(&task, &context, TaskState::InputRequired, "need input"));
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    return;
+                }
                 Some("lazy-done") => {
                     // Like "lazy", but the turn ends with the task completed.
                     let _inputs = ctx.inputs.take();
@@ -820,24 +826,17 @@ async fn an_idle_exchange_follows_a_turn_another_client_starts() {
 }
 
 #[tokio::test]
-async fn input_the_agent_never_read_is_answered_with_a_stream_error_not_silence() {
+async fn input_the_agent_never_read_when_its_turn_ends_is_taken_up_by_the_next_turn() {
     let (handler, release) = handler(true);
+    let p = params("1.1");
     let (up, uplink) = new_uplink();
     up.send(send("lazy", None)).await.unwrap();
-    let mut down = handler
-        .send_live_message(&params("1.1"), uplink)
-        .await
-        .unwrap();
+    let mut down = handler.send_live_message(&p, uplink).await.unwrap();
     let task_id = task_of(next(&mut down).await).id;
     assert_eq!(state_text(&next(&mut down).await).1, "lazy");
 
-    let mut ids = Vec::new();
     for text in ["x", "y"] {
-        let request = send(text, Some(&task_id));
-        if let StreamRequestPayload::SendMessage(r) = &request.payload {
-            ids.push(r.message.message_id.clone());
-        }
-        up.send(request).await.unwrap();
+        up.send(send(text, Some(&task_id))).await.unwrap();
         assert!(matches!(
             next(&mut down).await,
             StreamResponse::MessageUpdate(_)
@@ -845,26 +844,47 @@ async fn input_the_agent_never_read_is_answered_with_a_stream_error_not_silence(
     }
     release.notify_one();
 
-    // The turn ends without reading either: each sender is told so.
-    let mut told = Vec::new();
-    let mut ended_turn = false;
-    while told.len() < 2 || !ended_turn {
-        match next(&mut down).await {
-            StreamResponse::Error(error) => {
-                assert_eq!(error.code, "UNAVAILABLE");
-                told.push(error.reference_id.expect("it names the message"));
+    // The turn ends without reading either. They were accepted, so a turn
+    // takes them up, "x" as its message and "y" from its input: nobody is
+    // told they were not read.
+    let handled = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let task = handler
+                .get_task(
+                    &p,
+                    GetTaskRequest {
+                        id: task_id.clone(),
+                        history_length: None,
+                        tenant: None,
+                        timeline_length: None,
+                        current_generation: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let said = |text: &str| {
+                task.timeline.iter().flatten().any(|entry| {
+                    matches!(
+                        &entry.content,
+                        TimelineContent::Status(status)
+                            if status.message.as_ref().and_then(|m| m.text()) == Some(text)
+                    )
+                })
+            };
+            if said("got: y") {
+                return;
             }
-            StreamResponse::StatusUpdate(update)
-                if update.status.state == TaskState::InputRequired =>
-            {
-                ended_turn = true;
-            }
-            _ => {}
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    })
+    .await;
+    assert!(handled.is_ok(), "the next turn read the queued message");
+    while let Ok(Some(item)) = tokio::time::timeout(Duration::from_millis(300), down.next()).await {
+        assert!(
+            !matches!(item, Ok(StreamResponse::Error(_))),
+            "a message that was taken up was turned away: {item:?}"
+        );
     }
-    told.sort();
-    ids.sort();
-    assert_eq!(told, ids);
 }
 
 #[tokio::test]
@@ -1329,7 +1349,7 @@ async fn an_ordinary_streaming_subscriber_is_not_told_about_a_live_clients_unrea
     let (handler, release) = handler(true);
     let p = params("1.1");
     let (up, uplink) = new_uplink();
-    up.send(send("lazy", None)).await.unwrap();
+    up.send(send("lazy-done", None)).await.unwrap();
     let mut down = handler.send_live_message(&p, uplink).await.unwrap();
     let task_id = task_of(next(&mut down).await).id;
     next(&mut down).await; // lazy
@@ -1950,5 +1970,68 @@ async fn messages_racing_an_executor_that_fails_are_never_refused_for_a_closed_q
                 );
             }
         }
+    }
+}
+
+/// A client that answers INPUT_REQUIRED the moment it sees it reaches a turn
+/// that has asked for input but not yet returned. Its answer is not swallowed:
+/// the turn that follows handles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_answer_sent_as_the_turn_asks_for_input_is_handled_by_a_turn() {
+    for round in 0..30 {
+        let (handler, _) = handler(true);
+        let p = params("1.1");
+        let mut stream = match send("ask-slow", None).payload {
+            StreamRequestPayload::SendMessage(request) => {
+                handler.send_streaming_message(&p, request).await.unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let task_id = task_of(next(&mut stream).await).id;
+        loop {
+            if let StreamResponse::StatusUpdate(update) = next(&mut stream).await {
+                if update.status.state == TaskState::InputRequired {
+                    break;
+                }
+            }
+        }
+        // "quick" completes the task, which only a turn that ran can do.
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.send_message(&p, message_request("quick", &task_id)),
+        )
+        .await
+        .expect("no hang")
+        .expect("accepted");
+        let SendMessageResponse::Task(task) = reply else {
+            panic!("a task is returned");
+        };
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stored = handler
+                    .get_task(
+                        &p,
+                        GetTaskRequest {
+                            id: task_id.clone(),
+                            history_length: None,
+                            tenant: None,
+                            timeline_length: None,
+                            current_generation: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                if stored.status.state == TaskState::Completed {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "round {round}: the answer was recorded ({:?}) but no turn handled it",
+            task.status.state
+        );
     }
 }

@@ -20,7 +20,8 @@ pub struct HttpPushSender {
 pub struct HttpPushSenderConfig {
     /// HTTP request timeout (default: 30s).
     pub timeout: Duration,
-    /// If true, push sending errors abort execution.
+    /// If true, a failed delivery fails the execution it belongs to, at its
+    /// next event (deliveries are queued, so not at the one they are for).
     pub fail_on_error: bool,
     /// If true (default), guard push URLs against SSRF. A string pre-check
     /// (scheme must be http/https; host must not be a loopback, private,

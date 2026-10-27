@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt, stream::BoxStream};
+use futures::{StreamExt, stream::BoxStream};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Notify, RwLock, broadcast, mpsc, oneshot};
@@ -191,16 +191,174 @@ impl ActiveExecution {
     }
 }
 
+/// How many deliveries wait for a task's webhook before the oldest news is
+/// dropped: a receiver that is down must not make the server queue for ever,
+/// and a client that sees a gap in the generations reads the task instead.
+const PUSH_QUEUE_CAPACITY: usize = 1024;
+/// How long a task's delivery worker waits for more before it retires.
+const PUSH_WORKER_IDLE: Duration = Duration::from_secs(60);
+
+/// One webhook delivery.
+struct PushJob {
+    event: StreamResponse,
+    store: Arc<dyn crate::PushConfigStore>,
+    sender: Arc<crate::HttpPushSender>,
+    /// The execution whose event this is, or 0: a delivery that fails fails
+    /// that execution (`fail_on_error`).
+    execution: usize,
+}
+
+struct PushQueue {
+    id: u64,
+    tx: mpsc::Sender<PushJob>,
+}
+
+#[derive(Default)]
+struct PushQueuesInner {
+    queues: std::sync::Mutex<HashMap<TaskId, PushQueue>>,
+    failures: std::sync::Mutex<HashMap<TaskId, (usize, A2AError)>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+/// A queue and a worker per task that has webhooks to call. A task's
+/// deliveries go out one at a time, in the order they were queued, so what an
+/// execution publishes under its writer reaches the receiver in that order,
+/// and nothing that publishes waits for a receiver: a slow or re-entrant one
+/// only delays its own task's deliveries.
+#[derive(Default, Clone)]
+struct PushQueues(Arc<PushQueuesInner>);
+
+impl PushQueues {
+    /// Queues `event` for the task's webhooks. Never waits.
+    fn push(
+        &self,
+        task_id: &str,
+        execution: usize,
+        store: &Option<Arc<dyn crate::PushConfigStore>>,
+        sender: &Option<Arc<crate::HttpPushSender>>,
+        event: &StreamResponse,
+    ) {
+        let (Some(store), Some(sender)) = (store, sender) else {
+            return;
+        };
+        let mut job = PushJob {
+            event: event.clone(),
+            store: Arc::clone(store),
+            sender: Arc::clone(sender),
+            execution,
+        };
+        // A worker that is retiring has closed its queue: the next one is new.
+        for _ in 0..2 {
+            let tx = self.queue_for(task_id);
+            match tx.try_send(job) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(task_id, "webhook queue full; dropping a notification");
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(returned)) => job = returned,
+            }
+        }
+    }
+
+    fn queue_for(&self, task_id: &str) -> mpsc::Sender<PushJob> {
+        let mut queues = self
+            .0
+            .queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(queue) = queues.get(task_id).filter(|queue| !queue.tx.is_closed()) {
+            return queue.tx.clone();
+        }
+        let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY);
+        let id = self
+            .0
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        queues.insert(task_id.to_string(), PushQueue { id, tx: tx.clone() });
+        tokio::spawn(push_worker(
+            Arc::clone(&self.0),
+            task_id.to_string(),
+            id,
+            rx,
+        ));
+        tx
+    }
+
+    /// The failure of a delivery for `execution`, if one failed.
+    fn take_failure(&self, task_id: &str, execution: usize) -> Option<A2AError> {
+        let mut failures = self
+            .0
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match failures.get(task_id) {
+            Some((failed, _)) if *failed == execution => {
+                failures.remove(task_id).map(|(_, error)| error)
+            }
+            _ => None,
+        }
+    }
+}
+
+async fn push_worker(
+    inner: Arc<PushQueuesInner>,
+    task_id: TaskId,
+    id: u64,
+    mut rx: mpsc::Receiver<PushJob>,
+) {
+    loop {
+        let job = match tokio::time::timeout(PUSH_WORKER_IDLE, rx.recv()).await {
+            Ok(Some(job)) => job,
+            Ok(None) => break,
+            // Idle: retire. Close first, so a delivery queued meanwhile is
+            // still taken and a later one starts a new worker.
+            Err(_) => {
+                rx.close();
+                {
+                    let mut queues = inner
+                        .queues
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if queues.get(&task_id).is_some_and(|queue| queue.id == id) {
+                        queues.remove(&task_id);
+                    }
+                }
+                match rx.recv().await {
+                    Some(job) => job,
+                    None => break,
+                }
+            }
+        };
+        if let Err(error) = deliver_push_notifications(
+            &task_id,
+            job.store.as_ref(),
+            job.sender.as_ref(),
+            &job.event,
+        )
+        .await
+        {
+            tracing::warn!(task_id = %task_id, %error, "could not push a notification");
+            if job.execution != 0 {
+                inner
+                    .failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(task_id.clone(), (job.execution, error));
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct ExecutionManager {
     executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
     /// One writer lock per task, shared by whoever is mutating it. Held weakly
     /// so a task nobody is touching costs nothing.
     writers: std::sync::Mutex<TaskWriters>,
-    /// One lock per task that orders its push notifications: the last push of a
-    /// turn is still in flight when the next turn starts, and its webhook must
-    /// be called before the next turn's.
-    pushers: std::sync::Mutex<TaskWriters>,
+    /// The webhook deliveries of each task, in the order its events were
+    /// published.
+    pushes: PushQueues,
 }
 
 #[derive(Default)]
@@ -215,11 +373,6 @@ impl ExecutionManager {
     /// same task while either still holds it get the same lock.
     fn writer_for(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         Self::lock_for(&self.writers, task_id)
-    }
-
-    /// The task's push-ordering lock.
-    fn push_lock_for(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        Self::lock_for(&self.pushers, task_id)
     }
 
     fn lock_for(
@@ -389,6 +542,7 @@ impl Drop for ReservationGuard {
     }
 }
 
+#[derive(Clone)]
 struct ExecutionRuntime {
     executor: Arc<dyn crate::AgentExecutor>,
     task_store: Arc<dyn crate::TaskStore>,
@@ -498,67 +652,13 @@ fn unary_refusal(rejection: live::Rejection, request: &SendMessageRequest) -> A2
     }
 }
 
-/// Pushes `event` once the pushes of the task's earlier events are done.
-async fn send_push_notifications(
-    manager: &ExecutionManager,
-    task_id: &str,
-    push_config_store: Option<&dyn crate::PushConfigStore>,
-    push_sender: Option<&crate::HttpPushSender>,
-    event: &StreamResponse,
-) -> Result<(), A2AError> {
-    if push_config_store.is_none() || push_sender.is_none() {
-        return Ok(());
-    }
-    let _ordered = manager.push_lock_for(task_id).lock_owned().await;
-    deliver_push_notifications(task_id, push_config_store, push_sender, event).await
-}
-
-/// Pushes `events` in the background, after the pushes already queued for the
-/// task. The place in line is taken before this returns, so pushes made after
-/// it come after these.
-async fn spawn_push_notifications(
-    manager: &ExecutionManager,
-    task_id: &str,
-    store: Option<Arc<dyn crate::PushConfigStore>>,
-    sender: Option<Arc<crate::HttpPushSender>>,
-    events: Vec<StreamResponse>,
-) {
-    if store.is_none() || sender.is_none() || events.is_empty() {
-        return;
-    }
-    let mut ordered = Box::pin(manager.push_lock_for(task_id).lock_owned());
-    let held = futures::poll!(ordered.as_mut());
-    let task_id = task_id.to_string();
-    tokio::spawn(async move {
-        let _ordered = match held {
-            std::task::Poll::Ready(guard) => guard,
-            std::task::Poll::Pending => ordered.await,
-        };
-        for event in &events {
-            if let Err(error) =
-                deliver_push_notifications(&task_id, store.as_deref(), sender.as_deref(), event)
-                    .await
-            {
-                tracing::warn!(task_id = %task_id, %error, "could not push a live input");
-            }
-        }
-    });
-}
-
-/// [`send_push_notifications`] for a caller that holds the task's push lock.
+/// Calls the webhooks registered for the task with `event`.
 async fn deliver_push_notifications(
     task_id: &str,
-    push_config_store: Option<&dyn crate::PushConfigStore>,
-    push_sender: Option<&crate::HttpPushSender>,
+    push_config_store: &dyn crate::PushConfigStore,
+    push_sender: &crate::HttpPushSender,
     event: &StreamResponse,
 ) -> Result<(), A2AError> {
-    let Some(push_config_store) = push_config_store else {
-        return Ok(());
-    };
-    let Some(push_sender) = push_sender else {
-        return Ok(());
-    };
-
     let configs = push_config_store.list(task_id).await?;
     for config in configs {
         // The same rule as for streams: an appended message is only sent to a
@@ -1145,12 +1245,29 @@ async fn drive_execution(
     active: Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
 ) {
-    let mut stream = runtime.executor.execute(exec_ctx).peekable();
-    // Set once the turn has been closed ahead of the push of its last event.
+    // What a turn that takes over from this one inherits from the request.
+    let turn = TurnTemplate {
+        service_params: exec_ctx.service_params.clone(),
+        tenant: exec_ctx.tenant.clone(),
+        metadata: exec_ctx.metadata.clone(),
+    };
+    let mut stream = runtime.executor.execute(exec_ctx);
+    // Set once the execution has been released at a direct reply.
     let mut finished = false;
+    // Identifies this execution among the deliveries queued for the task.
+    let execution = Arc::as_ptr(&active) as usize;
 
     while let Some(result) = stream.next().await {
         if active.snapshot_is_terminal().await {
+            break;
+        }
+        // A webhook that failed, with `fail_on_error`, fails the execution.
+        if let Some(error) = runtime
+            .execution_manager
+            .pushes
+            .take_failure(&task_id, execution)
+        {
+            fail_execution(&runtime.execution_manager, &active, &task_id, &error).await;
             break;
         }
 
@@ -1226,6 +1343,17 @@ async fn drive_execution(
                                 if creating {
                                     save_pending_push_config(&active, &runtime).await;
                                 }
+                                // Queued under the writer, in the order events are
+                                // published, and never waited for.
+                                if published {
+                                    runtime.execution_manager.pushes.push(
+                                        &task_id,
+                                        execution,
+                                        &runtime.push_config_store,
+                                        &runtime.push_sender,
+                                        &event,
+                                    );
+                                }
                                 runtime.task_changed.notify_waiters();
                                 Some(published)
                             }
@@ -1248,70 +1376,6 @@ async fn drive_execution(
                 if !published {
                     continue;
                 }
-                // A webhook can take a while. If the executor has nothing more
-                // to say, the turn is closed first: the queue stops taking
-                // input and the execution is released, so a client that answers
-                // at once starts the next turn instead of being turned away,
-                // and the streams of this execution end without waiting for the
-                // webhook. The push goes on in the background, ahead of the
-                // next turn's (the task's push lock is taken before the release).
-                if !is_terminal_event(&event)
-                    && runtime.push_config_store.is_some()
-                    && runtime.push_sender.is_some()
-                    && matches!(
-                        std::pin::Pin::new(&mut stream).peek().now_or_never(),
-                        Some(None)
-                    )
-                {
-                    // Queued for the push lock now, without waiting for it:
-                    // the lock is handed out in order, so the next turn's
-                    // pushes come after this one's, and the turn is closed
-                    // below at once even if an earlier push is still running.
-                    let mut ordered = Box::pin(
-                        runtime
-                            .execution_manager
-                            .push_lock_for(&task_id)
-                            .lock_owned(),
-                    );
-                    let held = futures::poll!(ordered.as_mut());
-                    release_execution(&runtime.execution_manager, &active, &task_id).await;
-                    runtime.task_changed.notify_waiters();
-                    finished = true;
-                    let (store, sender) = (
-                        runtime.push_config_store.clone(),
-                        runtime.push_sender.clone(),
-                    );
-                    let task_id = task_id.clone();
-                    tokio::spawn(async move {
-                        let _ordered = match held {
-                            std::task::Poll::Ready(guard) => guard,
-                            std::task::Poll::Pending => ordered.await,
-                        };
-                        if let Err(error) = deliver_push_notifications(
-                            &task_id,
-                            store.as_deref(),
-                            sender.as_deref(),
-                            &event,
-                        )
-                        .await
-                        {
-                            tracing::warn!(task_id = %task_id, %error, "could not push the last event of a turn");
-                        }
-                    });
-                    break;
-                }
-                if let Err(error) = send_push_notifications(
-                    &runtime.execution_manager,
-                    &task_id,
-                    runtime.push_config_store.as_deref(),
-                    runtime.push_sender.as_deref(),
-                    &event,
-                )
-                .await
-                {
-                    fail_execution(&runtime.execution_manager, &active, &task_id, &error).await;
-                    break;
-                }
                 if is_terminal_event(&event) {
                     break;
                 }
@@ -1324,27 +1388,119 @@ async fn drive_execution(
     }
 
     if !finished {
-        // An executor that ended without saying anything still has a task: the
-        // one the request prepared.
-        {
-            let _writer = active.writer.lock().await;
-            if active
-                .uncreated
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                if let Some(task) = active.snapshot().await {
-                    match save_task_with(runtime.task_store.as_ref(), task, true).await {
-                        Ok(_) => save_pending_push_config(&active, &runtime).await,
-                        Err(error) => {
-                            tracing::warn!(task_id = %task_id, %error, "could not create the task");
-                        }
-                    }
-                }
-            }
-            release_execution_locked(&runtime.execution_manager, &active, &task_id).await;
-        }
+        end_turn(&runtime, &active, &task_id, &turn).await;
         runtime.task_changed.notify_waiters();
     }
+}
+
+/// What a turn that takes over from another inherits from the request.
+struct TurnTemplate {
+    service_params: ServiceParams,
+    tenant: Option<String>,
+    metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Ends a turn whose executor has returned, under the task's writer.
+///
+/// An executor that ended without saying anything still has a task: the one
+/// the request prepared. Messages the executor never read, while the task goes
+/// on, are not turned away: they were accepted and recorded, so the next turn
+/// is theirs. It starts here, under the same writer, with the first as its
+/// message and the rest queued. A message is accepted only if some turn will
+/// read it.
+async fn end_turn(
+    runtime: &ExecutionRuntime,
+    active: &Arc<ActiveExecution>,
+    task_id: &TaskId,
+    turn: &TurnTemplate,
+) {
+    let writer = Arc::clone(&active.writer).lock_owned().await;
+    if active
+        .uncreated
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        if let Some(task) = active.snapshot().await {
+            match save_task_with(runtime.task_store.as_ref(), task, true).await {
+                Ok(_) => save_pending_push_config(active, runtime).await,
+                Err(error) => {
+                    tracing::warn!(task_id = %task_id, %error, "could not create the task");
+                }
+            }
+        }
+    }
+    let snapshot = active.snapshot().await;
+    let goes_on = snapshot
+        .as_ref()
+        .is_some_and(|task| !task.status.state.is_terminal());
+    let unread = match active.inputs.get() {
+        Some(queue) if goes_on => queue.close_and_drain(),
+        _ => Vec::new(),
+    };
+    let (Some(snapshot), false) = (snapshot, unread.is_empty()) else {
+        release_execution_locked(&runtime.execution_manager, active, task_id).await;
+        return;
+    };
+    runtime.execution_manager.finish(task_id, active).await;
+    if let Err(unread) = start_next_turn(runtime, task_id, snapshot, unread, turn, writer).await {
+        // Nothing could take them over: they are answered, as at any end.
+        reject_inputs(active, task_id, unread).await;
+    }
+}
+
+/// Starts the turn that takes over `unread` messages, under the task's
+/// writer. Gives them back if it cannot.
+async fn start_next_turn(
+    runtime: &ExecutionRuntime,
+    task_id: &TaskId,
+    snapshot: Task,
+    mut unread: Vec<crate::executor::ClientInput>,
+    turn: &TurnTemplate,
+    writer: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<(), Vec<crate::executor::ClientInput>> {
+    let Ok((next, guard)) = runtime
+        .execution_manager
+        .reserve_held(task_id, writer)
+        .await
+    else {
+        return Err(unread);
+    };
+    next.set_snapshot(snapshot.clone()).await;
+    let first = unread.remove(0);
+    let queue = Arc::new(InputQueue::new(LIVE_INPUT_CAPACITY));
+    for input in unread {
+        if let Ok(permit) = queue.try_reserve() {
+            permit.send(input);
+        }
+    }
+    let _ = next.inputs.set(queue.clone());
+    let exec_ctx = crate::ExecutorContext {
+        message: Some(first.message),
+        task_id: task_id.clone(),
+        stored_task: Some(snapshot.clone()),
+        context_id: snapshot.context_id.clone(),
+        metadata: turn.metadata.clone(),
+        user: None,
+        service_params: turn.service_params.clone(),
+        tenant: turn.tenant.clone(),
+        inputs: Some(ClientInputs::from_queue(queue)),
+        new_task: false,
+    };
+    drop(guard);
+    let runtime = runtime.clone();
+    let task_id = task_id.clone();
+    tokio::spawn(run_execution(runtime, task_id, next, exec_ctx));
+    Ok(())
+}
+
+/// [`drive_execution_guarded`] as a boxed future: an execution can start the
+/// next one as it ends, which a plain `async fn` cannot prove `Send` for.
+fn run_execution(
+    runtime: ExecutionRuntime,
+    task_id: TaskId,
+    active: Arc<ActiveExecution>,
+    exec_ctx: crate::ExecutorContext,
+) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(drive_execution_guarded(runtime, task_id, active, exec_ctx))
 }
 
 /// Ends an execution's hold on its task in one step, under the task's writer:
@@ -1409,7 +1565,17 @@ async fn reject_unread_inputs_locked(active: &ActiveExecution, task_id: &str) {
     let Some(queue) = active.inputs.get() else {
         return;
     };
-    for input in queue.close_and_drain() {
+    reject_inputs(active, task_id, queue.close_and_drain()).await;
+}
+
+/// Answers each of `inputs` with a `StreamError` naming it. The caller holds
+/// the task's writer.
+async fn reject_inputs(
+    active: &ActiveExecution,
+    task_id: &str,
+    inputs: Vec<crate::executor::ClientInput>,
+) {
+    for input in inputs {
         let event = StreamResponse::Error(StreamError {
             task_id: task_id.to_string(),
             code: "UNAVAILABLE".to_string(),
@@ -1528,17 +1694,9 @@ async fn drive_execution_guarded(
     }
     reject_unread_inputs(&active, &task_id).await;
     if let Some(event) = failed_event {
-        if let Err(error) = send_push_notifications(
-            &manager,
-            &task_id,
-            push_config_store.as_deref(),
-            push_sender.as_deref(),
-            &event,
-        )
-        .await
-        {
-            tracing::warn!(task_id = %task_id, %error, "could not push the failure");
-        }
+        manager
+            .pushes
+            .push(&task_id, 0, &push_config_store, &push_sender, &event);
     }
     release_execution(&manager, &active, &task_id).await;
     task_changed.notify_waiters();
@@ -2135,18 +2293,13 @@ impl DefaultRequestHandler {
             if !published {
                 continue;
             }
-            if let Err(error) = send_push_notifications(
-                &self.execution_manager,
+            self.execution_manager.pushes.push(
                 task_id,
-                self.push_config_store.as_deref(),
-                self.push_sender.as_deref(),
+                0,
+                &self.push_config_store,
+                &self.push_sender,
                 &event,
-            )
-            .await
-            {
-                failure = Some(error);
-                break;
-            }
+            );
             if is_terminal_event(&event) {
                 break;
             }
@@ -2161,19 +2314,15 @@ impl DefaultRequestHandler {
         };
         // The recorded transition is announced like any other, even when the
         // cancel itself is about to be reported as failed.
-        let pushed = match &recorded {
-            Ok(Some(event)) => {
-                send_push_notifications(
-                    &self.execution_manager,
-                    task_id,
-                    self.push_config_store.as_deref(),
-                    self.push_sender.as_deref(),
-                    event,
-                )
-                .await
-            }
-            _ => Ok(()),
-        };
+        if let Ok(Some(event)) = &recorded {
+            self.execution_manager.pushes.push(
+                task_id,
+                0,
+                &self.push_config_store,
+                &self.push_sender,
+                event,
+            );
+        }
         if let Some(error) = failure {
             if let Some(active) = active {
                 publish_error(active, &error).await;
@@ -2181,7 +2330,7 @@ impl DefaultRequestHandler {
             return Err(error);
         }
         recorded?;
-        pushed
+        Ok(())
     }
 
     /// Applies one event of a cancel under the task's writer lock. Returns
