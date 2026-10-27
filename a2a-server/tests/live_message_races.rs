@@ -105,6 +105,7 @@ struct Flaky {
     inner: Arc<InMemoryTaskStore>,
     panic_after_update: Arc<AtomicBool>,
     panic_get: Arc<AtomicBool>,
+    panic_on_canceled: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -123,7 +124,14 @@ impl a2a_server::TaskStore for Flaky {
         if self.panic_get.swap(false, Ordering::SeqCst) {
             panic!("store panicked in get");
         }
-        self.inner.get(task_id).await
+        let task = self.inner.get(task_id).await;
+        // Armed, it panics on every read of a task that has been canceled.
+        if self.panic_on_canceled.load(Ordering::SeqCst)
+            && matches!(&task, Ok(Some(t)) if t.status.state == TaskState::Canceled)
+        {
+            panic!("store panicked reading a canceled task");
+        }
+        task
     }
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
         self.inner.list(req).await
@@ -364,10 +372,27 @@ async fn p4_session_panic_tells_the_downlink() {
         .send_live_message(&p, ReceiverStream::new(rx).boxed())
         .await
         .unwrap();
-    next(&mut down).await;
+    let task_id = match next(&mut down).await {
+        StreamResponse::Task(task) => task.id,
+        other => panic!("{other:?}"),
+    };
     next(&mut down).await; // INPUT_REQUIRED
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    store.panic_get.store(true, Ordering::SeqCst); // the idle recheck reads the task
+    // Another client cancels the task: the idle session wakes and reads it, and
+    // the store panics on that read.
+    store.panic_on_canceled.store(true, Ordering::SeqCst);
+    let canceller = h.clone();
+    tokio::spawn(async move {
+        let _ = canceller
+            .cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: task_id,
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await;
+    });
     let end = tokio::time::timeout(Duration::from_secs(3), down.next())
         .await
         .expect("the downlink ends");

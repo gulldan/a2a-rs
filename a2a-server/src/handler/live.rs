@@ -249,12 +249,6 @@ fn generation_of(event: &StreamResponse) -> Option<i64> {
     }
 }
 
-/// How soon an idle session looks at its task again, and how far it backs off
-/// while nothing changes. (A server-wide wake-up for every change anywhere
-/// would have every idle session reading the store each time.)
-const IDLE_RECHECK: Duration = Duration::from_millis(250);
-const IDLE_RECHECK_MAX: Duration = Duration::from_secs(1);
-
 /// What looking at an idle task found.
 enum Reattach {
     /// The exchange is over (the task ended, or is gone).
@@ -663,7 +657,7 @@ impl DefaultRequestHandler {
             );
         }
         drop(writer);
-        self.task_changed.notify_waiters();
+        self.changes.notify(task_id);
 
         Ok(Delivery::Injected {
             task,
@@ -776,6 +770,9 @@ impl LiveRun {
         mut uplink: Uplink,
         out: Downlink,
     ) {
+        // Watched from here, so a change from now on is seen however it is
+        // timed against the looks below.
+        let mut watch = self.handler.changes.watch(&self.task_id);
         // The generation the client has been told of, so a change it was not
         // there for (an idle task, then another client's turn) is noticed.
         let mut last_generation = seen_generation;
@@ -786,7 +783,15 @@ impl LiveRun {
             }
         }
         let mut uplink_open = true;
-        let mut idle_wait = IDLE_RECHECK;
+        // What happened between the opening and the watch is looked at once.
+        if inner.is_none()
+            && matches!(
+                self.reattach(&mut inner, &mut last_generation, &out).await,
+                Reattach::End
+            )
+        {
+            return self.finish(uplink).await;
+        }
         loop {
             tokio::select! {
                 // The client went away: nothing is left to deliver to.
@@ -820,15 +825,12 @@ impl LiveRun {
                 },
                 // Nothing is running that this exchange follows: it watches the
                 // task, so another client's turn, or a cancel, reaches it too.
-                () = tokio::time::sleep(idle_wait), if inner.is_none() => {
-                    match self.reattach(&mut inner, &mut last_generation, &out).await {
-                        Reattach::End => break,
-                        // Something happened: look again soon.
-                        Reattach::Changed => idle_wait = IDLE_RECHECK,
-                        // Nothing did: look a little less often, up to a limit.
-                        Reattach::Unchanged => {
-                            idle_wait = (idle_wait * 2).min(IDLE_RECHECK_MAX);
-                        }
+                () = watch.changed(), if inner.is_none() => {
+                    if matches!(
+                        self.reattach(&mut inner, &mut last_generation, &out).await,
+                        Reattach::End
+                    ) {
+                        break;
                     }
                 },
                 item = uplink.next(), if uplink_open => match item {

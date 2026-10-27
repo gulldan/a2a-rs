@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Notify, RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
 use crate::executor::{ClientInputs, InputQueue};
 use crate::middleware::ServiceParams;
@@ -383,6 +383,71 @@ async fn push_worker(
     }
 }
 
+/// Tells whoever is watching a task that it changed: a long-poll for its next
+/// generation, an idle live exchange. Per task, so a change wakes only the
+/// watchers of that task, and a watcher is woken by every change since it last
+/// looked, however it timed its look.
+#[derive(Default)]
+struct TaskChanges {
+    watched: std::sync::Mutex<HashMap<TaskId, std::sync::Weak<tokio::sync::watch::Sender<u64>>>>,
+}
+
+/// A watcher of one task; keeps the task's channel open while it lives.
+struct TaskWatch {
+    _channel: Arc<tokio::sync::watch::Sender<u64>>,
+    changes: tokio::sync::watch::Receiver<u64>,
+}
+
+impl TaskWatch {
+    /// Waits until the task has changed since this watcher last looked.
+    async fn changed(&mut self) {
+        // The sender is held by this watcher, so the channel does not close.
+        let _ = self.changes.changed().await;
+    }
+}
+
+impl TaskChanges {
+    fn watch(&self, task_id: &str) -> TaskWatch {
+        let mut watched = self
+            .watched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        watched.retain(|_, channel| channel.strong_count() > 0);
+        let channel = match watched.get(task_id).and_then(std::sync::Weak::upgrade) {
+            Some(channel) => channel,
+            None => {
+                let channel = Arc::new(tokio::sync::watch::channel(0).0);
+                watched.insert(task_id.to_string(), Arc::downgrade(&channel));
+                channel
+            }
+        };
+        TaskWatch {
+            changes: channel.subscribe(),
+            _channel: channel,
+        }
+    }
+
+    /// `task_id` changed.
+    fn notify(&self, task_id: &str) {
+        let channel = self
+            .watched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(task_id)
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(channel) = channel {
+            channel.send_modify(|version| *version += 1);
+        }
+    }
+
+    /// The task `event` is about changed.
+    fn notify_event(&self, event: &StreamResponse) {
+        if let Some(task_id) = task_id_for_event(event) {
+            self.notify(task_id);
+        }
+    }
+}
+
 #[derive(Default)]
 struct ExecutionManager {
     executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
@@ -579,7 +644,7 @@ struct ExecutionRuntime {
     push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<Arc<crate::HttpPushSender>>,
     execution_manager: Arc<ExecutionManager>,
-    task_changed: Arc<Notify>,
+    changes: Arc<TaskChanges>,
 }
 
 struct SubscriptionState {
@@ -1320,7 +1385,7 @@ async fn drive_execution(
                         .await;
                 }
                 release_execution(&runtime.execution_manager, &active, &task_id).await;
-                runtime.task_changed.notify_waiters();
+                runtime.changes.notify(&task_id);
                 finished = true;
                 // The executor may go on working until it returns, but nothing
                 // it says now belongs to any task.
@@ -1388,7 +1453,7 @@ async fn drive_execution(
                                         &event,
                                     );
                                 }
-                                runtime.task_changed.notify_waiters();
+                                runtime.changes.notify(&task_id);
                                 Some(published)
                             }
                             Err(error) => {
@@ -1423,7 +1488,7 @@ async fn drive_execution(
 
     if !finished {
         end_turn(&runtime, &active, &task_id, &turn).await;
-        runtime.task_changed.notify_waiters();
+        runtime.changes.notify(&task_id);
     }
 }
 
@@ -1661,7 +1726,7 @@ async fn drive_execution_guarded(
 
     let task_store = Arc::clone(&runtime.task_store);
     let manager = Arc::clone(&runtime.execution_manager);
-    let task_changed = Arc::clone(&runtime.task_changed);
+    let changes = Arc::clone(&runtime.changes);
     let push_config_store = runtime.push_config_store.clone();
     let push_sender = runtime.push_sender.clone();
     let outcome = std::panic::AssertUnwindSafe(drive_execution(
@@ -1733,7 +1798,7 @@ async fn drive_execution_guarded(
             .push(&task_id, 0, &push_config_store, &push_sender, &event);
     }
     release_execution(&manager, &active, &task_id).await;
-    task_changed.notify_waiters();
+    changes.notify(&task_id);
 }
 
 /// Transport-agnostic request handler interface.
@@ -1877,7 +1942,7 @@ pub struct DefaultRequestHandler {
     default_input_modes: Vec<String>,
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
     extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
-    task_changed: Arc<Notify>,
+    changes: Arc<TaskChanges>,
     long_poll_timeout: Duration,
     live: Arc<LiveSessions>,
 }
@@ -1915,7 +1980,7 @@ impl DefaultRequestHandler {
             default_input_modes: Vec::new(),
             authorizer: None,
             extended_agent_card: None,
-            task_changed: Arc::new(Notify::new()),
+            changes: Arc::new(TaskChanges::default()),
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
             live: Arc::new(LiveSessions::default()),
         }
@@ -2060,13 +2125,9 @@ impl DefaultRequestHandler {
     /// current state when the timeout elapses or the task is terminal.
     async fn wait_for_generation(&self, task_id: &str, current: i64) -> Result<Task, A2AError> {
         let deadline = tokio::time::Instant::now() + self.long_poll_timeout;
+        // Watching before the store is read: a change landing in between is seen.
+        let mut watch = self.changes.watch(task_id);
         loop {
-            // Registered before the store is read, so a change landing in
-            // between still wakes this wait.
-            let changed = self.task_changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-
             let task = self.load_task(task_id).await?;
             if task.generation > current || task.status.state.is_terminal() {
                 return Ok(task);
@@ -2076,7 +2137,7 @@ impl DefaultRequestHandler {
                 return Ok(task);
             }
             tokio::select! {
-                _ = &mut changed => {}
+                () = watch.changed() => {}
                 _ = tokio::time::sleep((deadline - now).min(LONG_POLL_RECHECK)) => {}
             }
         }
@@ -2432,7 +2493,7 @@ impl DefaultRequestHandler {
                 published
             }
         };
-        self.task_changed.notify_waiters();
+        self.changes.notify_event(event);
         Ok(published)
     }
 
@@ -2508,7 +2569,7 @@ impl DefaultRequestHandler {
                     apply_event_to_task(self.task_store.as_ref(), Some(base), &mut event).await?;
                 }
             }
-            self.task_changed.notify_waiters();
+            self.changes.notify_event(&event);
             return Ok(Some(event));
         }
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -2521,7 +2582,7 @@ impl DefaultRequestHandler {
         if let Some(active) = active {
             active.publish(Ok(&event), None).await;
         }
-        self.task_changed.notify_waiters();
+        self.changes.notify_event(&event);
         Ok(Some(event))
     }
 
@@ -2575,7 +2636,7 @@ impl DefaultRequestHandler {
                     apply_event_to_task(self.task_store.as_ref(), base, &mut event).await?;
             }
         }
-        self.task_changed.notify_waiters();
+        self.changes.notify_event(&event);
         Ok(Some(event))
     }
 
@@ -2663,7 +2724,7 @@ impl DefaultRequestHandler {
                 }
             }
         };
-        self.task_changed.notify_waiters();
+        self.changes.notify(&task_id);
         // An executor that reads live input gets a queue for it, owned by the
         // server so what the executor never reads is not lost. It is in place
         // before the writer is let go, so no message is turned away for want of
@@ -2703,7 +2764,7 @@ impl DefaultRequestHandler {
             push_config_store: self.push_config_store.clone(),
             push_sender: self.push_sender.clone(),
             execution_manager: Arc::clone(&self.execution_manager),
-            task_changed: Arc::clone(&self.task_changed),
+            changes: Arc::clone(&self.changes),
         };
         let active_execution = active.clone();
         let execution_task_id = task_id.clone();
@@ -2995,7 +3056,7 @@ impl RequestHandler for DefaultRequestHandler {
         }
         drop(transition);
         // The task changed under every long-poll waiting on it.
-        self.task_changed.notify_waiters();
+        self.changes.notify(&req.id);
 
         let exec_ctx = crate::ExecutorContext {
             message: None,

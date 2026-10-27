@@ -194,6 +194,39 @@ async fn pushes_of_a_later_turn_and_a_cancel_wait_for_the_last_push_of_the_turn_
         .send_message(&params(), req("two", Some(&task_id), None))
         .await
         .unwrap();
+    // The second turn may start a moment after the call returns (a message
+    // that reaches the first turn as it ends is taken up by the next): cancel
+    // once it has said its piece.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let task = h
+                .get_task(
+                    &params(),
+                    GetTaskRequest {
+                        id: task_id.clone(),
+                        history_length: None,
+                        tenant: None,
+                        timeline_length: None,
+                        current_generation: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let said = task.timeline.iter().flatten().any(|entry| {
+                matches!(
+                    &entry.content,
+                    TimelineContent::Status(status)
+                        if status.message.as_ref().and_then(|m| m.text()) == Some("reply-to-two")
+                )
+            });
+            if said {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second turn runs");
     let _ = h
         .cancel_task(
             &params(),
@@ -205,29 +238,44 @@ async fn pushes_of_a_later_turn_and_a_cancel_wait_for_the_last_push_of_the_turn_
         )
         .await
         .unwrap();
-    // Deliveries are made one at a time: wait for all four, not for a while.
+    // Deliveries are made one at a time: wait for the last, not for a while.
     let order = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let seen = order.lock().unwrap().clone();
-            if seen.iter().filter(|s| s.starts_with("done:")).count() == 4 {
+            if seen.iter().any(|s| s == "done:\"c\"") {
                 return seen;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("all four deliveries are made: {:?}", order.lock().unwrap()));
+    .unwrap_or_else(|_| {
+        panic!(
+            "the cancel was never delivered: {:?}",
+            order.lock().unwrap()
+        )
+    });
+    // One at a time, in the order the events were published.
     let arrivals: Vec<_> = order
         .iter()
-        .filter(|s| s.starts_with("arrive:"))
-        .cloned()
+        .filter(|s| s.starts_with("arrive:") && !s.ends_with('?'))
+        .map(String::as_str)
         .collect();
-    let pos = |t: &str| order.iter().position(|s| s == t);
-    assert!(
-        pos("done:reply-to-one").is_some() && pos("done:reply-to-one") < pos("arrive:w-two"),
+    assert_eq!(
+        arrivals,
+        [
+            "arrive:reply-to-one",
+            "arrive:w-two",
+            "arrive:reply-to-two",
+            "arrive:\"c\""
+        ],
         "{order:?}"
     );
-    assert_eq!(arrivals.len(), 4, "{order:?}");
+    let pos = |t: &str| order.iter().position(|s| s == t);
+    assert!(
+        pos("done:reply-to-one") < pos("arrive:w-two"),
+        "turn two was pushed before turn one's last delivery finished: {order:?}"
+    );
 }
 
 /// A receiver that has not answered a push, for example because it is calling
