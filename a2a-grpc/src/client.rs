@@ -53,11 +53,14 @@ impl GrpcTransport {
 fn service_params_to_metadata(params: &ServiceParams) -> tonic::metadata::MetadataMap {
     let mut metadata = tonic::metadata::MetadataMap::new();
     for (key, values) in params {
+        if values.is_empty() {
+            continue;
+        }
         if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) {
-            for value in values {
-                if let Ok(val) = value.parse() {
-                    metadata.insert(key.clone(), val);
-                }
+            // A2A §10.2: several values of one parameter (e.g. A2A-Extensions)
+            // are comma-separated in a single metadata entry.
+            if let Ok(val) = values.join(",").parse() {
+                metadata.insert(key, val);
             }
         }
     }
@@ -384,8 +387,12 @@ mod tests {
             "x-multi".to_string(),
             vec!["a".to_string(), "b".to_string()],
         );
+        params.insert("x-empty".to_string(), Vec::new());
         let metadata = service_params_to_metadata(&params);
         assert!(metadata.get("x-custom").is_some());
+        let multi: Vec<_> = metadata.get_all("x-multi").iter().collect();
+        assert_eq!(multi, ["a,b"], "every value, in one entry");
+        assert!(metadata.get("x-empty").is_none(), "no value, no entry");
     }
 
     #[test]
