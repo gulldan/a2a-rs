@@ -447,17 +447,72 @@ mod tests {
         assert_eq!(rendered, "2026-09-23T02:07:57Z");
     }
 
-    /// A key-based fix rather than a blind string replace: an unrelated
-    /// field whose value happens to end the same way as the buggy timestamp
-    /// format (e.g. user-supplied text) must never be rewritten.
+    /// Only the schema's own Timestamp fields are rewritten: a `timestamp`
+    /// key inside opaque user data (`Part.data`, `metadata`) is theirs, and
+    /// its bytes are left exactly as given.
     #[test]
-    fn test_normalize_timestamp_strings_ignores_unrelated_fields() {
-        let mut json = serde_json::json!({
-            "notATimestamp": "ends with +00:00",
-            "nested": { "alsoNotATimestamp": "also +00:00" }
+    fn test_user_data_under_a_timestamp_key_is_left_alone() {
+        let timestamp = "2026-09-23T02:07:57Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let mut task = sample_task_with_timestamp(timestamp);
+        let data = serde_json::json!({
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "note": "ends with +00:00",
         });
-        normalize_timestamp_strings(&mut json);
-        assert_eq!(json["notATimestamp"], "ends with +00:00");
-        assert_eq!(json["nested"]["alsoNotATimestamp"], "also +00:00");
+        task.history = Some(vec![a2a::Message::new(
+            a2a::Role::User,
+            vec![a2a::Part::data(data.clone())],
+        )]);
+        task.metadata = Some(std::collections::HashMap::from([(
+            "timestamp".to_string(),
+            Value::String("2025-01-01T00:00:00+00:00".into()),
+        )]));
+
+        let json = to_value(&task).unwrap();
+        assert_eq!(json["status"]["timestamp"], "2026-09-23T02:07:57Z");
+        assert_eq!(json["history"][0]["parts"][0]["data"], data);
+        assert_eq!(json["metadata"]["timestamp"], "2025-01-01T00:00:00+00:00");
+    }
+
+    /// Every response that embeds a task normalizes its timestamp through
+    /// its own path.
+    #[test]
+    fn test_embedded_task_timestamps_use_z_suffix() {
+        let timestamp = "2026-09-23T02:07:57Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let task = sample_task_with_timestamp(timestamp);
+
+        let json = to_value(&SendMessageResponse::Task(task.clone())).unwrap();
+        assert_eq!(json["task"]["status"]["timestamp"], "2026-09-23T02:07:57Z");
+
+        let json = to_value(&StreamResponse::Task(task.clone())).unwrap();
+        assert_eq!(json["task"]["status"]["timestamp"], "2026-09-23T02:07:57Z");
+
+        let update = a2a::TaskStatusUpdateEvent {
+            task_id: task.id.clone(),
+            context_id: task.context_id.clone(),
+            status: task.status.clone(),
+            metadata: None,
+        };
+        let json = to_value(&StreamResponse::StatusUpdate(update)).unwrap();
+        assert_eq!(
+            json["statusUpdate"]["status"]["timestamp"],
+            "2026-09-23T02:07:57Z"
+        );
+
+        let request = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: None,
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: Some(timestamp),
+            include_artifacts: None,
+            tenant: None,
+        };
+        let json = to_value(&request).unwrap();
+        assert_eq!(json["statusTimestampAfter"], "2026-09-23T02:07:57Z");
     }
 }
