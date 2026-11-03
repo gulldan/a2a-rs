@@ -47,48 +47,54 @@ pub trait ProtoJsonPayload: Sized {
     /// always present that proto3's own JSON convention omits when it's
     /// left at its default.
     fn normalize_json(_value: &mut Value) {}
+
+    /// Where this type's `google.protobuf.Timestamp` fields sit in its JSON,
+    /// as paths from the root; `*` stands for every element of an array.
+    /// Only these are rewritten to the `Z` form, so a `timestamp` key inside
+    /// opaque user data (`Part.data`, `metadata`) is never touched.
+    fn timestamp_paths() -> &'static [&'static [&'static str]] {
+        &[]
+    }
 }
 
 pub fn to_value<T: ProtoJsonPayload>(value: &T) -> Result<Value, ProtoJsonPayloadError> {
     let proto = T::to_proto(value);
     let protojson: T::ProtoJson = transcode_message(&proto)?;
     let mut json = serde_json::to_value(protojson).map_err(ProtoJsonPayloadError::Json)?;
-    normalize_timestamp_strings(&mut json);
+    for path in T::timestamp_paths() {
+        normalize_timestamp_at(&mut json, path);
+    }
     T::normalize_json(&mut json);
     Ok(json)
 }
-
-/// JSON field names in `a2a.proto` whose value is a `google.protobuf.Timestamp`.
-const TIMESTAMP_FIELD_NAMES: &[&str] = &["timestamp", "statusTimestampAfter"];
 
 /// `pbjson_types::Timestamp`'s own `Serialize` emits an RFC 3339 string with
 /// a numeric `+00:00` offset (e.g. `"...846477544+00:00"`); the protobuf
 /// JSON canonical mapping requires the `Z` UTC designator instead
 /// (<https://protobuf.dev/programming-guides/proto3/#json>), and DM-SERIAL-001
-/// enforces exactly that. Recurses through the whole tree, keyed by field
-/// name rather than a blind string match, so an unrelated string value that
-/// happens to end the same way (e.g. user-supplied message text) is never
-/// touched.
-fn normalize_timestamp_strings(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, v) in map.iter_mut() {
-                if TIMESTAMP_FIELD_NAMES.contains(&key.as_str()) {
-                    if let Value::String(s) = v {
-                        if let Some(prefix) = s.strip_suffix("+00:00") {
-                            *s = format!("{prefix}Z");
-                        }
-                    }
+/// enforces exactly that. Rewrites the string at one schema path only, so
+/// nothing a client or agent put under a key of the same name is changed.
+fn normalize_timestamp_at(value: &mut Value, path: &[&str]) {
+    match path.split_first() {
+        None => {
+            if let Value::String(s) = value {
+                if let Some(prefix) = s.strip_suffix("+00:00") {
+                    *s = format!("{prefix}Z");
                 }
-                normalize_timestamp_strings(v);
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                normalize_timestamp_strings(item);
+        Some((&"*", rest)) => {
+            if let Value::Array(items) = value {
+                for item in items {
+                    normalize_timestamp_at(item, rest);
+                }
             }
         }
-        _ => {}
+        Some((key, rest)) => {
+            if let Some(child) = value.get_mut(*key) {
+                normalize_timestamp_at(child, rest);
+            }
+        }
     }
 }
 
@@ -125,7 +131,8 @@ where
 }
 
 macro_rules! impl_protojson_payload {
-    ($native:path, $proto:path, $protojson:path, $to_proto:path, $from_proto:path) => {
+    ($native:path, $proto:path, $protojson:path, $to_proto:path, $from_proto:path
+     $(, timestamps = $timestamps:expr)?) => {
         impl ProtoJsonPayload for $native {
             type Proto = $proto;
             type ProtoJson = $protojson;
@@ -137,12 +144,17 @@ macro_rules! impl_protojson_payload {
             fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
                 Ok($from_proto(value))
             }
+
+            $(fn timestamp_paths() -> &'static [&'static [&'static str]] {
+                $timestamps
+            })?
         }
     };
 }
 
 macro_rules! impl_protojson_payload_optional {
-    ($native:path, $proto:path, $protojson:path, $to_proto:path, $from_proto:path) => {
+    ($native:path, $proto:path, $protojson:path, $to_proto:path, $from_proto:path
+     $(, timestamps = $timestamps:expr)?) => {
         impl ProtoJsonPayload for $native {
             type Proto = $proto;
             type ProtoJson = $protojson;
@@ -154,9 +166,21 @@ macro_rules! impl_protojson_payload_optional {
             fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
                 $from_proto(value).ok_or(ProtoJsonPayloadError::MissingPayload(stringify!($native)))
             }
+
+            $(fn timestamp_paths() -> &'static [&'static [&'static str]] {
+                $timestamps
+            })?
         }
     };
 }
+
+/// The one `status.timestamp` a Task carries, and where a Task sits inside
+/// the responses that embed one.
+const TASK_TIMESTAMP: &[&str] = &["status", "timestamp"];
+const EMBEDDED_TASK_TIMESTAMP: &[&str] = &["task", "status", "timestamp"];
+const STATUS_UPDATE_TIMESTAMP: &[&str] = &["statusUpdate", "status", "timestamp"];
+const LISTED_TASK_TIMESTAMP: &[&str] = &["tasks", "*", "status", "timestamp"];
+const STATUS_TIMESTAMP_AFTER: &[&str] = &["statusTimestampAfter"];
 
 impl_protojson_payload!(
     SendMessageRequest,
@@ -177,7 +201,8 @@ impl_protojson_payload!(
     crate::proto::ListTasksRequest,
     crate::protojson::ListTasksRequest,
     crate::pbconv::to_proto_list_tasks_request,
-    crate::pbconv::from_proto_list_tasks_request
+    crate::pbconv::from_proto_list_tasks_request,
+    timestamps = &[STATUS_TIMESTAMP_AFTER]
 );
 impl_protojson_payload!(
     CancelTaskRequest,
@@ -233,7 +258,8 @@ impl_protojson_payload!(
     crate::proto::Task,
     crate::protojson::Task,
     crate::pbconv::to_proto_task,
-    crate::pbconv::from_proto_task
+    crate::pbconv::from_proto_task,
+    timestamps = &[TASK_TIMESTAMP]
 );
 impl ProtoJsonPayload for ListTasksResponse {
     type Proto = crate::proto::ListTasksResponse;
@@ -245,6 +271,10 @@ impl ProtoJsonPayload for ListTasksResponse {
 
     fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
         Ok(crate::pbconv::from_proto_list_tasks_response(value))
+    }
+
+    fn timestamp_paths() -> &'static [&'static [&'static str]] {
+        &[LISTED_TASK_TIMESTAMP]
     }
 
     /// REQ-TASK-LIST-002: `nextPageToken` must always be present, even on
@@ -299,14 +329,16 @@ impl_protojson_payload_optional!(
     crate::proto::SendMessageResponse,
     crate::protojson::SendMessageResponse,
     crate::pbconv::to_proto_send_message_response,
-    crate::pbconv::from_proto_send_message_response
+    crate::pbconv::from_proto_send_message_response,
+    timestamps = &[EMBEDDED_TASK_TIMESTAMP]
 );
 impl_protojson_payload_optional!(
     StreamResponse,
     crate::proto::StreamResponse,
     crate::protojson::StreamResponse,
     crate::pbconv::to_proto_stream_response,
-    crate::pbconv::from_proto_stream_response
+    crate::pbconv::from_proto_stream_response,
+    timestamps = &[EMBEDDED_TASK_TIMESTAMP, STATUS_UPDATE_TIMESTAMP]
 );
 
 #[cfg(test)]
